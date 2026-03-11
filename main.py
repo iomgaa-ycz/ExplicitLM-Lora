@@ -78,9 +78,17 @@ def _cmd_build_knowledge(cfg: Any, args: argparse.Namespace) -> None:
 
 def _cmd_train(cfg: Any, args: argparse.Namespace) -> None:
     """Phase 1-3: 训练管线。"""
-    print(
-        f"[WARN] train --phase {args.phase}: 前置模块 §1.10 (pipeline) 未实现，无法执行。"
-    )
+    if args.phase == 1:
+        from training.phase1_router import train_phase1
+
+        device = getattr(args, "device", "cpu")
+        train_phase1(cfg, device)
+    elif args.phase == 2:
+        print("[WARN] train --phase 2: Fusion 预训练尚未实现")
+    elif args.phase == 3:
+        print("[WARN] train --phase 3: SFT 尚未实现")
+    else:
+        print(f"[WARN] train --phase {args.phase}: 未知阶段")
 
 
 def _cmd_eval(cfg: Any, args: argparse.Namespace) -> None:
