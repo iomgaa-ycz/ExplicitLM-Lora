@@ -28,6 +28,7 @@ PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import load_config  # noqa: E402
+from pipeline import ExplicitLMPipeline  # noqa: E402
 
 
 # ─────────────────────────────────────────────
@@ -83,13 +84,65 @@ def _cmd_train(cfg: Any, args: argparse.Namespace) -> None:
 
 
 def _cmd_eval(cfg: Any, args: argparse.Namespace) -> None:
-    """评测入口。"""
-    print("[WARN] eval: 前置模块 §1.10 (pipeline) 未实现，无法执行。")
+    """
+    评测入口：从 checkpoint 加载 ExplicitLMPipeline，打印加载状态。
+
+    当前实现为管线加载验证（smoke test），完整评测逻辑在训练管线完成后接入。
+    """
+    device = getattr(args, "device", "cpu")
+    router_ckpt = str(Path(cfg.paths.checkpoint_dir) / "phase1_best")
+    fusion_ckpt = str(Path(cfg.paths.checkpoint_dir) / "phase2_best")
+    store_path = str(Path(cfg.paths.data_dir) / "store.pt")
+
+    if not Path(store_path).exists():
+        print(f"[WARN] eval: 知识库文件不存在 ({store_path})，跳过加载。")
+        print("[INFO] eval: 请先运行 build-knowledge 构建知识库。")
+        return
+
+    pipeline = ExplicitLMPipeline.from_checkpoints(
+        config=cfg,
+        router_ckpt=router_ckpt,
+        fusion_ckpt=fusion_ckpt,
+        store_path=store_path,
+        device=device,
+    )
+    print(f"[INFO] eval: ExplicitLMPipeline 加载成功 (device={device})")
+    print(f"[INFO] eval: 知识库条目数 next_free={pipeline._store.next_free}")
 
 
 def _cmd_answer(cfg: Any, args: argparse.Namespace) -> None:
-    """端到端 QA。"""
-    print("[WARN] answer: 前置模块 §1.10 (pipeline) 未实现，无法执行。")
+    """
+    端到端 QA：从 checkpoint 加载管线，对输入问题生成答案。
+
+    用法：python main.py --device cuda:0 answer --question "What causes pneumonia?"
+    """
+    question: str = getattr(args, "question", None)
+    if not question:
+        print("[ERROR] answer: 请通过 --question 指定问题文本。")
+        return
+
+    device = getattr(args, "device", "cpu")
+    router_ckpt = str(Path(cfg.paths.checkpoint_dir) / "phase1_best")
+    fusion_ckpt = str(Path(cfg.paths.checkpoint_dir) / "phase2_best")
+    store_path = str(Path(cfg.paths.data_dir) / "store.pt")
+
+    if not Path(store_path).exists():
+        print(f"[WARN] answer: 知识库文件不存在 ({store_path})，跳过。")
+        print("[INFO] answer: 请先运行 build-knowledge 构建知识库。")
+        return
+
+    pipeline = ExplicitLMPipeline.from_checkpoints(
+        config=cfg,
+        router_ckpt=router_ckpt,
+        fusion_ckpt=fusion_ckpt,
+        store_path=store_path,
+        device=device,
+    )
+    result = pipeline.answer(question, use_real_router=True)
+    print(f"[Question] {question}")
+    print(f"[Answer]   {result.answer}")
+    print(f"[KnowledgeID] {result.retrieved_id}")
+    print(f"[Latency]  {result.latency_ms:.1f} ms")
 
 
 # ─────────────────────────────────────────────
@@ -112,7 +165,8 @@ def main() -> None:
         "--phase", type=int, required=True, choices=[0, 1, 2, 3], help="训练阶段"
     )
     subparsers.add_parser("eval", help="评测入口")
-    subparsers.add_parser("answer", help="端到端 QA")
+    answer_parser = subparsers.add_parser("answer", help="端到端 QA")
+    answer_parser.add_argument("--question", type=str, required=False, help="问题文本")
 
     args = parser.parse_args()
     cli_overrides = _parse_overrides(args.override or [])

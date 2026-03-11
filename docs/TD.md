@@ -978,18 +978,25 @@ input_ids [B, L]  +  knowledge_ids [B, K_f]
 
 ### 1.10 pipeline.py — 端到端管线
 
-**状态**: ⬜ 待实现 · L6 管线 · 前置: §1.7,§1.9 · 解锁: 训练管线 · 测试: `test_pipeline.py`
+**状态**: ✅ 已完成 · L6 管线 · 前置: §1.7,§1.9 · 解锁: 训练管线 · 测试: `test_pipeline.py` (12 tests, 93% cov)
 
 **文件**: `pipeline.py`
-**职责**: 串联 Router 检索 → 知识编码 → 生成的完整推理流程，提供统一对外接口。
+**职责**: 串联 Router 检索 → KnowledgeEncoder 编码 → ModifiedQwen 生成的完整推理流程，提供统一对外接口。
+
+**核心数据类**:
+
+```python
+@dataclass
+class PipelineOutput:
+    answer: str          # greedy decode 最后一个 token
+    retrieved_id: int    # 路由检索到的知识条目全局 ID
+    latency_ms: float    # 全流程耗时（毫秒）
+```
+
+**主类接口**:
 
 ```python
 class ExplicitLMPipeline:
-    """
-    端到端推理管线（无梯度）:
-    query text → Router 检索 → 注入知识 → Qwen3 生成 → answer
-    """
-
     def __init__(
         self,
         config: Config,
@@ -997,63 +1004,77 @@ class ExplicitLMPipeline:
         router: MemoryRouter,
         store: DualKnowledgeStore,
         tokenizer: AutoTokenizer,
+        oracle_map: Optional[Dict[str, int]] = None,  # question text → knowledge_id
     ): ...
 
     @classmethod
     def from_checkpoints(
         cls,
         config: Config,
-        router_ckpt: str,    # Phase 1 最优权重
-        fusion_ckpt: str,    # Phase 2/3 最优权重
-        store_path: str,     # 知识库路径
-    ) -> "ExplicitLMPipeline":
-        """从 checkpoint 加载完整管线"""
+        router_ckpt: str,    # Phase 1 最优权重目录
+        fusion_ckpt: str,    # Phase 2/3 最优权重目录
+        store_path: str,     # DualKnowledgeStore .pt 文件路径
+        device: str = "cpu",
+        oracle_map: Optional[Dict[str, int]] = None,
+    ) -> "ExplicitLMPipeline": ...
 
-    def answer(
-        self, question: str, use_real_router: bool = True
-    ) -> PipelineOutput:
+    def _embed_query(self, question: str) -> Tensor:
+        """tokenize + KnowledgeEncoder.encode_mean → [1, D]（双向注意力 + mean pool）"""
+
+    @torch.no_grad()
+    def answer(self, question: str, use_real_router: bool = True) -> PipelineOutput:
         """
-        Args:
-            question:         用户问题（原始文本）
-            use_real_router:  True=真实路由, False=Oracle 知识（实验用）
-
-        流程:
-          1. 路由检索（如 use_real_router）:
-               q_emb = modified_qwen.embed(question)  → [1, D]
-               knowledge_ids = router.retrieve(q_emb, store)  → [1, K_f]
-             否则（Oracle）:
-               knowledge_ids = lookup_oracle_knowledge(question)
-
-          2. 生成:
-               output = modified_qwen(input_ids, knowledge_ids, ...)
-               answer = tokenizer.decode(output.logits.argmax(-1))
-
-        Returns:
-            PipelineOutput(
-                answer:        str,
-                retrieved_id:  int,   # 检索到的知识条目 ID
-                latency_ms:    float,
-            )
+        演示用端到端推理（greedy argmax 解码最后一个 token）。
+        流程：
+          1. _embed_query → q_emb [1, D]
+          2. router.retrieve(q_emb, store) 或 oracle_map 查表 → knowledge_ids [1, K_f]
+          3. tokenize question → input_ids [1, L]
+          4. modified_qwen(input_ids, knowledge_ids, attention_mask) → logits [1, L, V]
+          5. logits[0, -1, :].argmax() → decode → answer str
         """
 
+    @torch.no_grad()
     def evaluate_loglikelihood(
         self, question: str, choices: List[str], knowledge_ids: Tensor
     ) -> int:
         """
-        多选题评测（loglikelihood 方法）:
-          对 " A"/" B"/" C"/" D" 各做 forward，取 continuation log-prob 最高者
-          → 预测选项 idx (0-3)
+        多选题评测核心接口（loglikelihood 方法）。
+        对每个 choice：
+          full_ids = q_ids + [" " + choice_ids]
+          labels = [-100 × L_q, choice_ids]（只计算 continuation loss）
+          log_prob = -output.loss × len(c_ids)
+        返回 argmax(log_probs)，值域 [0, len(choices))
         """
 ```
+
+**Checkpoint 目录约定**（.pt 格式，与 DualKnowledgeStore.save_state 一致）：
+
+```
+router_ckpt/
+    router.pt              # MemoryRouter.state_dict()（pkm + adapter + selector）
+fusion_ckpt/
+    injection_modules.pt   # injection_modules.state_dict()
+    encoder_layers.pt      # KnowledgeEncoder.layers.state_dict()（Phase 2 解冻后，可选）
+    encoder_norm.pt        # KnowledgeEncoder.norm.state_dict()（可选）
+```
+
+文件不存在时 log WARNING 后跳过（使用随机初始化权重），store_path 不存在时 raise FileNotFoundError。
+
+**Oracle 模式**：传入 `oracle_map: Dict[str, int]`（question text → knowledge_id），调用
+`answer(question, use_real_router=False)` 时直接查表取知识，用于上限实验（E4 G2/G3）。
+未提供 oracle_map 时 use_real_router=False 会 raise ValueError。
+
+**设计决策**：query embedding 使用 `knowledge_encoder.encode_mean()`（双向注意力 + mean pool），
+不通过 `modified_qwen.embed()`，确保与路由器训练时的编码方式一致。
 
 **依赖**: 所有 models/router 模块，transformers
 
 **验证 Checkpoint**:
-- [ ] 单元测试全部通过
-- [ ] 覆盖率 ≥ 80%
-- [ ] `tests/integration/test_pipeline_flow.py` 端到端验证通过
-- [ ] Markdown 报告生成到 `tests/outputs/pipeline/`
-- [ ] 端到端 query→answer 可运行
+- [x] 单元测试全部通过（12 tests）
+- [x] 覆盖率 ≥ 80%（实际 93%）
+- [x] `tests/integration/test_pipeline_flow.py` 端到端验证通过（5 tests）
+- [x] Markdown 报告生成到 `tests/outputs/pipeline/`
+- [x] 端到端 query→answer 可运行
 
 ---
 
