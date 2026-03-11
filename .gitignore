@@ -56,6 +56,7 @@ tests/outputs/*
 # 模型目录（大文件，不提交）
 qwen3-0.6B/
 llmlingua-2-xlm-roberta-large-meetingbank/
+Qwen3-0.6B/
 
 # 参考项目（仅本地使用）
 Reference/
