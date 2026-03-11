@@ -37,6 +37,8 @@
 
 ### 1.1 config.py — 配置管理
 
+**状态**: ✅ 已完成 · L0 基础 · 前置: 无 · 解锁: 全部 · 测试: `test_config.py` (8 tests)
+
 **文件**: `config.py`（dataclass 定义 + 加载逻辑）+ `config/default.yaml`（全量配置值）+ `.env.example`（敏感信息模板）
 **职责**: 所有超参数的 dataclass 类型定义（无默认值，YAML 漏写即报错）+ 三层优先级加载。
 
@@ -62,14 +64,15 @@ class ModelConfig:
 
 @dataclass
 class RouterConfig:
-    knowledge_num: int           # 1024 * 1024（1M 条目）
-    dim: int                     # 1024（backbone hidden_dim）
-    query_dim: int               # 1024（query_proj 输出维度）
-    key_proj_dim: int            # 512（行/列键投影维度）
-    adapter_dim: int             # 512（FeatureAdapter 输出维度）
-    num_candidates: int          # 32（RefinedSelector 输入候选数）
-    temperature: float           # 0.1（PKM 路由温度）
-    recluster_threshold: float   # 0.1（触发 recluster 的变更比例）
+    knowledge_num: int             # 1024 * 1024（1M 条目）
+    dim: int                       # 1024（backbone hidden_dim）
+    query_dim: int                 # 1024（query_proj 输出维度）
+    key_proj_dim: int              # 512（行/列键投影维度，= dim // 2）
+    adapter_dim: int               # 512（FeatureAdapter 输出维度）
+    num_candidates: int            # 32（粗排固定输出候选数）
+    temperature: float             # 0.1（PKM 路由温度）
+    recluster_threshold: float     # 0.1（触发 recluster 的变更比例）
+    max_candidates_per_cell: int   # -1=全量倒排索引；>0=每格上限（=1时退化为1:1映射）
 
 @dataclass
 class TrainConfig:
@@ -163,6 +166,8 @@ def load_config(yaml_path: str, cli_overrides: Optional[Dict[str, Any]] = None) 
 ---
 
 ### 1.2 router/memory_bank.py — 双存储架构
+
+**状态**: ✅ 已完成 · L1 存储 · 前置: §1.1 · 解锁: §1.4,§1.5,§1.7,§1.10 · 测试: `test_memory_bank.py` (19 tests)
 
 **文件**: `router/memory_bank.py`
 **职责**: 双路知识存储（Fusion Bank + Anchor Bank），支持动态增删、近似 cluster 分配和物理压缩。
@@ -289,8 +294,9 @@ class DualKnowledgeStore:
 
 ### 1.3 models/qwen_wrapper.py — 知识编码器
 
+**状态**: ✅ 已完成 · L2 编码 · 前置: §1.1 · 解锁: §1.7,§1.9,§1.10 · 测试: `test_qwen_wrapper.py` (12 tests)
+
 **文件**: `models/qwen_wrapper.py`
-**状态**: ✅ 已实现（12 个测试全部通过）
 **职责**: 封装 Qwen3 前 N 层作为知识编码器，将知识 token IDs 上下文化为稠密向量供注入。
 
 #### `load_base_model(model_path: str, bf16: bool) -> AutoModelForCausalLM`
@@ -366,60 +372,97 @@ def encode_mean(self, knowledge_ids: Tensor, attention_mask: Tensor) -> Tensor:
 
 ### 1.4 router/memory_gate.py — Product Key Memory（粗排）
 
+**状态**: ✅ 已完成 · L2 粗排 · 前置: §1.1,§1.2 · 解锁: §1.7 · 测试: `test_memory_gate.py` (19 tests)
+
 **文件**: `router/memory_gate.py`
-**职责**: 两维独立路由，将 N 条知识映射到 √N × √N 网格，O(√N) 时间检索 ~64 候选。
+**职责**: 两维独立路由，将 N 条知识映射到 √N × √N 网格，O(√N) 时间检索 num_candidates 个候选。
 
 ```python
 class ProductKeyMemory(nn.Module):
-    """两维独立 Product Key Memory，粗排检索约 64 个候选条目。"""
+    """两维独立 Product Key Memory，粗排检索固定 num_candidates 个候选条目。"""
 
     def __init__(self, config: RouterConfig):
-        self.query_proj = Linear(config.dim, config.query_dim)
-        # row_keys [√N, key_proj_dim], col_keys [√N, key_proj_dim]
-        self.row_key_proj = Linear(config.key_proj_dim, config.key_proj_dim)
-        self.col_key_proj = Linear(config.key_proj_dim, config.key_proj_dim)
-        self.num_keys = int(config.knowledge_num ** 0.5)  # √N
-        self.K_COARSE = 4   # 每维 top-k，共 4×4=16 个候选 cluster
+        # 可训练投影层（无 bias）
+        self.query_proj   = Linear(config.dim, config.query_dim, bias=False)
+        self.row_key_proj = Linear(config.key_proj_dim, config.key_proj_dim, bias=False)
+        self.col_key_proj = Linear(config.key_proj_dim, config.key_proj_dim, bias=False)
+        # 非训练 Keys：register_buffer [√N, key_proj_dim]，初始全零
+        # 通过 update_keys() 更新，不从 store 动态读取
+        register_buffer("row_keys", zeros(num_keys, config.key_proj_dim))
+        register_buffer("col_keys", zeros(num_keys, config.key_proj_dim))
+        self.num_keys    = int(config.knowledge_num ** 0.5)  # √N
+        self.K_COARSE    = 4     # 每维 top-k，共 4×4=16 个候选 cluster
         self.temperature = config.temperature
+        self.num_candidates          = config.num_candidates
+        self.max_candidates_per_cell = config.max_candidates_per_cell
+
+    def update_keys(self, row_keys: Tensor, col_keys: Tensor) -> None:
+        """每 epoch 在 compact_and_recluster 后调用，更新 register_buffer 中的 keys。
+        典型调用：pkm.update_keys(store.row_centroids, store.col_centroids)
+        入参形状：[√N, key_proj_dim]，dtype=torch.float
+        """
 
     def forward(
         self,
-        embedding: Tensor,       # [B, D]
+        embedding: Tensor,        # [B, D]
         store: DualKnowledgeStore,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         粗排检索流程:
-          q = query_proj(embedding)           → [B, query_dim]
-          q1, q2 = split(q, dim=-1)          → [B, 512], [B, 512]
-          q1, q2 = L2_normalize(q1/q2)
+          # Phase 1: 查询侧投影 + 分割 + L2 归一化
+          q = query_proj(embedding)              → [B, query_dim=1024]
+          q1, q2 = q.chunk(2, dim=-1)           → [B, 512] × 2
+          q1, q2 = L2_normalize(q1), L2_normalize(q2)
 
-          scores_1 = q1 @ row_key_proj(row_keys).T  → [B, √N]
-          scores_2 = q2 @ col_key_proj(col_keys).T  → [B, √N]
+          # Phase 2: Key 侧投影 + L2 归一化（register_buffer，无梯度）
+          k1 = L2_normalize(row_key_proj(row_keys))  → [√N, 512]
+          k2 = L2_normalize(col_key_proj(col_keys))  → [√N, 512]
 
-          top_rows = topk(scores_1 / τ, K_COARSE=4) → [B, 4]
-          top_cols = topk(scores_2 / τ, K_COARSE=4) → [B, 4]
+          # Phase 3: 温度缩放分数
+          scores_1 = q1 @ k1.T / τ              → [B, √N]
+          scores_2 = q2 @ k2.T / τ              → [B, √N]
 
-          grid_indices = rows × √N + cols → [B, 16]  # 笛卡儿积
-          candidates = lookup(inverted_index, grid_indices)  → [B, ~64]
+          # Phase 4: Top-K + 笛卡儿积
+          top_rows = topk(scores_1, K_COARSE=4).indices  → [B, 4]
+          top_cols = topk(scores_2, K_COARSE=4).indices  → [B, 4]
+          grid_indices = top_rows[:,:,None]*√N + top_cols[:,None,:]
+                        .reshape(B, 16)                  → [B, 16]
+
+          # Phase 5: 倒排索引查询（支持 max_candidates_per_cell 限制）
+          candidates = _lookup_candidates(grid_indices, store)  → [B, num_candidates]
 
         Returns:
-            candidates: Tensor[B, ~64]  — 候选知识条目 ID
-            scores_1:   Tensor[B, √N]   — 行匹配分数（KL 训练用）
-            scores_2:   Tensor[B, √N]   — 列匹配分数（KL 训练用）
-            q_adapted:  Tensor[B, 512]  — 经 L2 归一化的查询（传给 RefinedSelector）
+            candidates: Tensor[B, num_candidates]  — 候选知识条目 ID（固定大小，不足则重复填充）
+            scores_1:   Tensor[B, √N]              — 行匹配分数（训练损失用）
+            scores_2:   Tensor[B, √N]              — 列匹配分数（训练损失用）
+            q_adapted:  Tensor[B, key_proj_dim]    — q1（L2 归一化，传给 RefinedSelector）
+        """
+
+    def _lookup_candidates(
+        self, grid_indices: Tensor, store: DualKnowledgeStore
+    ) -> Tensor:
+        """
+        倒排索引查询：遍历 16 个 grid cell，从 store.inverted_index 汇聚候选 ID。
+        max_candidates_per_cell:
+            -1  → 每格取全部条目（热更新多条/格场景）
+            >0  → 每格最多取该数目（=1 时退化为 1:1 简单映射）
+        不足 num_candidates 时循环重复填充；空 store 时全零填充。
         """
 ```
 
 **关键设计**:
-- **两维分解**：`q [B, 1024]` 分成 `q1, q2 [B, 512]`，各自独立匹配 row_keys / col_keys
-- **倒排索引查询**：`cluster_offsets` + `cluster_counts` 做常数时间区间查询，不遍历 N
-- row_keys / col_keys **不参与梯度**，每 epoch 通过 `DualKnowledgeStore.compact_and_recluster` 更新
+- **register_buffer Keys**：`row_keys / col_keys` 存于模块内，随 save/load 持久化；通过 `update_keys()` 更新而非每次 forward 从 store 读取（对齐参考项目设计）
+- **双侧 L2 归一化**：查询侧（q1/q2）和 Key 侧（k1/k2）均做 L2 normalize，保证余弦相似度语义
+- **`q_adapted = q1`**：直接返回归一化行子查询 `[B, key_proj_dim]`；FeatureAdapter 独立于 PKM，不在此处调用
+- **倒排索引 + 可配置 cap**：`max_candidates_per_cell`（default=-1）控制每格取条数，=1 时退化为参考项目的 1:1 映射风格
 
-**依赖**: torch, router/memory_bank.py
+**依赖**: torch, router/memory_bank.py（DualKnowledgeStore）, config.py（RouterConfig）
 
 ---
 
 ### 1.5 router/clustering.py — 独立子空间聚类
+
+**状态**: ⬜ 待实现 · L3 聚类 · 前置: §1.2 · 解锁: §1.2(recluster),§1.7 · 测试: `test_clustering.py`
 
 **文件**: `router/clustering.py`
 **职责**: 每 epoch 将 Anchor Bank 的所有 embeddings 聚类，更新 row_keys / col_keys 和倒排索引。
@@ -498,9 +541,18 @@ class SubspaceClustering:
 
 **依赖**: numpy, scipy（SVD）
 
+**验证 Checkpoint**:
+- [ ] 单元测试全部通过
+- [ ] 覆盖率 ≥ 80%
+- [ ] `tests/integration/test_clustering_flow.py` 端到端验证通过
+- [ ] Markdown 报告生成到 `tests/outputs/clustering/`
+- [ ] cluster 均衡 max/mean < 3；PCA 子空间正交
+
 ---
 
 ### 1.6 router/feature_adapter.py + router/refined_selector.py — 精排系统
+
+**状态**: ⬜ 待实现 · L3 精排 · 前置: 无硬依赖 · 解锁: §1.7 · 测试: `test_feature_adapter.py`, `test_refined_selector.py`
 
 **文件**: `router/feature_adapter.py`, `router/refined_selector.py`
 **职责**: 防止特征坍缩的查询投影（FeatureAdapter）+ 从 ~64 候选中精选 Top-1 的交叉编码器（RefinedSelector）。
@@ -566,9 +618,19 @@ class RefinedSelector(nn.Module):
 
 **依赖**: torch, router/memory_bank.py
 
+**验证 Checkpoint**:
+- [ ] 单元测试全部通过
+- [ ] 覆盖率 ≥ 80%
+- [ ] `tests/integration/test_refined_selector_flow.py` 端到端验证通过
+- [ ] Markdown 报告生成到 `tests/outputs/refined_selector/`
+- [ ] FeatureAdapter 输出稳定（无 NaN/Inf）
+- [ ] RefinedSelector best_idx ∈ [0, C)
+
 ---
 
 ### 1.7 router/model.py — MemoryRouter 整合
+
+**状态**: ⬜ 待实现 · L4 整合 · 前置: §1.4,§1.5,§1.6 · 解锁: §1.10 · 测试: `test_router_model.py`
 
 **文件**: `router/model.py`
 **职责**: 组合 ProductKeyMemory + FeatureAdapter + RefinedSelector，提供统一的检索接口。
@@ -620,9 +682,18 @@ class MemoryRouter(nn.Module):
 
 **依赖**: router/memory_gate.py, router/feature_adapter.py, router/refined_selector.py, router/memory_bank.py
 
+**验证 Checkpoint**:
+- [ ] 单元测试全部通过
+- [ ] 覆盖率 ≥ 80%
+- [ ] `tests/integration/test_router_model_flow.py` 端到端验证通过
+- [ ] Markdown 报告生成到 `tests/outputs/router_model/`
+- [ ] best_id ∈ [0, N)；可训练参数量 ~15M
+
 ---
 
 ### 1.8 models/injection_modules.py — 注入模块
+
+**状态**: ⬜ 待实现 · L4 注入（可与 L3 并行）· 前置: 无 · 解锁: §1.9 · 测试: `test_injection_modules.py`
 
 **文件**: `models/injection_modules.py`
 **职责**: 定义三种知识注入方式，共享统一接口 `forward(hidden, knowledge, mask) → hidden`。
@@ -729,9 +800,18 @@ class GatedInjection(BaseInjection):
 
 **依赖**: torch
 
+**验证 Checkpoint**:
+- [ ] 单元测试全部通过
+- [ ] 覆盖率 ≥ 80%
+- [ ] `tests/integration/test_injection_flow.py` 端到端验证通过
+- [ ] Markdown 报告生成到 `tests/outputs/injection/`
+- [ ] 零初始化残差不变性：初始 forward 输出 ≈ hidden
+
 ---
 
 ### 1.9 models/modified_model.py — ModifiedQwen
+
+**状态**: ⬜ 待实现 · L5 模型 · 前置: §1.3,§1.8 · 解锁: §1.10 · 测试: `test_modified_model.py`
 
 **文件**: `models/modified_model.py`
 **职责**: 通过 Hook 机制在 Qwen3 指定层注入知识，实现无侵入式融合。
@@ -826,9 +906,18 @@ input_ids [B, L]  +  knowledge_ids [B, K_f]
 
 **依赖**: transformers, models/injection_modules.py, models/qwen_wrapper.py
 
+**验证 Checkpoint**:
+- [ ] 单元测试全部通过
+- [ ] 覆盖率 ≥ 80%
+- [ ] `tests/integration/test_modified_model_flow.py` 端到端验证通过
+- [ ] Markdown 报告生成到 `tests/outputs/modified_model/`
+- [ ] Hook 正确注册到 4 层；logits 形状 [B,L,V]
+
 ---
 
 ### 1.10 pipeline.py — 端到端管线
+
+**状态**: ⬜ 待实现 · L6 管线 · 前置: §1.7,§1.9 · 解锁: 训练管线 · 测试: `test_pipeline.py`
 
 **文件**: `pipeline.py`
 **职责**: 串联 Router 检索 → 知识编码 → 生成的完整推理流程，提供统一对外接口。
@@ -897,6 +986,13 @@ class ExplicitLMPipeline:
 ```
 
 **依赖**: 所有 models/router 模块，transformers
+
+**验证 Checkpoint**:
+- [ ] 单元测试全部通过
+- [ ] 覆盖率 ≥ 80%
+- [ ] `tests/integration/test_pipeline_flow.py` 端到端验证通过
+- [ ] Markdown 报告生成到 `tests/outputs/pipeline/`
+- [ ] 端到端 query→answer 可运行
 
 ---
 
@@ -1008,6 +1104,18 @@ for batch in fusion_dataloader:
 | **GPU** | 2×（6,7） | 2×（6,7） | 2×（6,7） |
 | **可训练** | PKM + FeatureAdapter + RefinedSelector | AttentionInjection × 4 + KnowledgeEncoder | 同 Phase 2 |
 | **冻结** | Qwen3 全量 | Qwen3 + Router | Qwen3 + Router |
+
+### 2.5 训练管线构建依赖
+
+训练管线要求所有 §1.1-1.10 模块完成后才可运行：
+
+| Phase | 依赖模块 | main.py 子命令 |
+|-------|---------|---------------|
+| Phase 0 知识构建 | §1.2,§1.3,§1.5 | `build-knowledge` |
+| Phase 1 Router 训练 | §1.7（含 §1.4-1.6） | `train --phase 1` |
+| Phase 2 Fusion 预训练 | §1.9（含 §1.8） | `train --phase 2` |
+| Phase 3 SFT | §1.10 | `train --phase 3` |
+| 评测 | §1.10 | `eval` |
 
 ---
 
