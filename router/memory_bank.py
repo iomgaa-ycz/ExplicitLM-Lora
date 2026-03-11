@@ -577,6 +577,52 @@ class DualKnowledgeStore:
                 self.inverted_index[pos] = data_indices[i]
                 self.cluster_counts[gidx] += 1
 
+    def get_rowcol_labels(self) -> torch.Tensor:
+        """
+        从倒排索引重建每条知识条目的 (row, col) cluster 标签。
+
+        实现：遍历所有非空 cluster（cluster_counts > 0），
+        将 inverted_index 中对应位置的 entry_id 映射到该 cluster 的 (row, col)。
+        时间复杂度 O(min(N, num_cells))，仅遍历非空格。
+
+        返回：
+            [next_free, 2] torch.long 张量：
+                [:, 0] = row cluster 标签（值域 [0, num_keys)）
+                [:, 1] = col cluster 标签（值域 [0, num_keys)）
+            若 next_free=0 返回空张量 shape=(0, 2)
+
+        前置：
+            必须在 compact_and_recluster 之后调用（pca_matrix 不为 None）
+            否则所有条目 row/col 均为 0（倒排索引未初始化）
+
+        异常：
+            无，但若 pca_matrix 为 None，结果无意义（静默返回全 0）
+        """
+        n = self.next_free
+        if n == 0:
+            return torch.zeros((0, 2), dtype=torch.long, device=self.device)
+
+        num_keys = self._num_keys
+        id_to_rowcol = torch.zeros(n, 2, dtype=torch.long, device=self.device)
+
+        # Phase 1: 仅遍历非空 cluster，避免全量枚举 num_keys² 个格子
+        nonempty_cells = torch.where(self.cluster_counts > 0)[0]  # [n_nonempty]
+
+        for g_tensor in nonempty_cells:
+            g = int(g_tensor.item())
+            row = g // num_keys
+            col = g % num_keys
+            start = int(self.cluster_offsets[g].item())
+            count = int(self.cluster_counts[g].item())
+            # Phase 2: 取出该格中的 entry_id，过滤 -1（填充值）
+            entries = self.inverted_index[start : start + count]
+            valid = entries[entries >= 0]
+            if valid.numel() > 0:
+                id_to_rowcol[valid, 0] = row
+                id_to_rowcol[valid, 1] = col
+
+        return id_to_rowcol
+
     def save_state(self, path: str) -> None:
         """
         序列化所有状态到文件（供 checkpoint 保存）。
