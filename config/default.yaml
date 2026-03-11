@@ -39,6 +39,10 @@ router:
   recluster_threshold: 0.1
   # 粗排每个 grid cell 最多取多少候选（-1=全量倒排索引，1=简单1:1映射）
   max_candidates_per_cell: -1
+  # RefinedSelector Transformer 注意力头数（adapter_dim=512 必须能被此值整除）
+  refined_num_heads: 8
+  # RefinedSelector Transformer 层数（2 层轻量设计，参数量约 2M）
+  refined_num_layers: 2
 
 train:
   # Phase 1: Router 训练（PKM + FeatureAdapter + RefinedSelector）

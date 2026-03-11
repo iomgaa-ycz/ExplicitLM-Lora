@@ -68,6 +68,8 @@ class RouterConfig:
         max_candidates_per_cell: 粗排每个 grid cell 最多取多少候选
             -1 = 全量（倒排索引，热更新多条/格场景）
             >0 = 每格上限（=1 时退化为 1:1 简单映射，对齐参考项目行为）
+        refined_num_heads: RefinedSelector Transformer 注意力头数（adapter_dim 必须能整除）
+        refined_num_layers: RefinedSelector Transformer 层数
     """
 
     knowledge_num: int
@@ -79,6 +81,8 @@ class RouterConfig:
     temperature: float
     recluster_threshold: float
     max_candidates_per_cell: int
+    refined_num_heads: int
+    refined_num_layers: int
 
 
 @dataclass
