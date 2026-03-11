@@ -69,6 +69,10 @@ train:
   grad_clip: 1.0
   # 是否使用 bfloat16 混合精度
   bf16: true
+  # Phase 1 梯度累积步数（等效 batch_size = phase1_batch_size × phase1_gradient_accumulation_steps）
+  phase1_gradient_accumulation_steps: 8
+  # Phase 1 重聚类时 compact_and_recluster 内部 encoder 编码批大小
+  phase1_recluster_batch_size: 10240
 
 data:
   # 压缩后知识 token 数（需与 model.fusion_length 保持一致）
@@ -79,10 +83,16 @@ data:
   num_workers: 4
   # 训练样本上限，-1 表示使用全量数据
   train_max_samples: -1
+  # Phase 1 Router 训练数据（预压缩 FineWeb-Edu Parquet 目录）
+  phase1_parquet_dir: "data/compressed/v2"
+  # Phase 1 tokenize 批大小（tokenize text/compressed_text 时的批大小）
+  phase1_tokenize_batch_size: 10000
+  # Phase 1 重聚类时 encoder 编码的分块大小（避免 OOM）
+  phase1_recluster_chunk_size: 64
 
 paths:
   # 基础模型权重目录（可被 .env 中的 MODEL_PATH 覆盖为绝对路径）
-  model_dir: "models/qwen3-0.6B"
+  model_dir: "Qwen3-0.6B"
   # LLMLingua 压缩模型目录（可被 .env 中的 LLMLINGUA_PATH 覆盖）
   llmlingua_model_dir: "models/llmlingua-2-xlm-roberta-large"
   # 数据根目录
@@ -93,6 +103,14 @@ paths:
   log_dir: "logs"
   # 评测结果保存目录
   results_dir: "results"
+
+swanlab:
+  # SwanLab 项目名称
+  project: "explicit-lora-phase1"
+  # 是否启用 SwanLab 追踪
+  enabled: true
+  # 每隔多少训练步上报一次指标
+  log_every_n_steps: 50
 
 eval:
   # MedQA 知识映射文件（question → compressed_knowledge）

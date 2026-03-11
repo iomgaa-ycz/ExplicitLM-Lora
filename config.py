@@ -106,6 +106,8 @@ class TrainConfig:
         phase3_warmup_steps: Phase 3 warmup 步数
         grad_clip: 梯度裁剪最大范数
         bf16: 是否使用 bfloat16 混合精度训练
+        phase1_gradient_accumulation_steps: Phase 1 梯度累积步数（Accelerate）
+        phase1_recluster_batch_size: Phase 1 重聚类时 encoder 编码批大小
     """
 
     phase1_lr: float
@@ -123,6 +125,8 @@ class TrainConfig:
     phase3_warmup_steps: int
     grad_clip: float
     bf16: bool
+    phase1_gradient_accumulation_steps: int
+    phase1_recluster_batch_size: int
 
 
 @dataclass
@@ -135,12 +139,18 @@ class DataConfig:
         anchor_length: 原文截断 token 数（应与 ModelConfig.anchor_length 一致）
         num_workers: DataLoader 并行 worker 数
         train_max_samples: 训练样本上限，-1 表示使用全量数据
+        phase1_parquet_dir: Phase 1 Router 训练数据目录（预压缩 FineWeb-Edu Parquet）
+        phase1_tokenize_batch_size: Phase 1 tokenize 批大小
+        phase1_recluster_chunk_size: Phase 1 重聚类编码分块大小（避免 OOM）
     """
 
     fusion_length: int
     anchor_length: int
     num_workers: int
     train_max_samples: int
+    phase1_parquet_dir: str
+    phase1_tokenize_batch_size: int
+    phase1_recluster_chunk_size: int
 
 
 @dataclass
@@ -163,6 +173,22 @@ class PathsConfig:
     checkpoint_dir: str
     log_dir: str
     results_dir: str
+
+
+@dataclass
+class SwanLabConfig:
+    """
+    SwanLab 实验追踪配置
+
+    参数：
+        project: SwanLab 项目名称
+        enabled: 是否启用 SwanLab 追踪（False 时跳过所有 swanlab 调用）
+        log_every_n_steps: 每隔多少训练步上报一次指标
+    """
+
+    project: str
+    enabled: bool
+    log_every_n_steps: int
 
 
 @dataclass
@@ -197,6 +223,7 @@ class Config:
         data: 数据处理配置
         paths: 文件系统路径配置
         eval: 评测配置
+        swanlab: SwanLab 实验追踪配置
     """
 
     model: ModelConfig
@@ -205,6 +232,7 @@ class Config:
     data: DataConfig
     paths: PathsConfig
     eval: EvalConfig
+    swanlab: SwanLabConfig
 
 
 # ─────────────────────────────────────────────
@@ -339,7 +367,7 @@ def _dict_to_config(config_dict: Dict[str, Any]) -> Config:
         KeyError: 顶层 section（model/router/...）缺失
     """
     # Phase 1: 校验顶层 section 存在
-    required_sections = ["model", "router", "train", "data", "paths", "eval"]
+    required_sections = ["model", "router", "train", "data", "paths", "eval", "swanlab"]
     for section in required_sections:
         if section not in config_dict:
             raise KeyError(
@@ -376,6 +404,11 @@ def _dict_to_config(config_dict: Dict[str, Any]) -> Config:
     except TypeError as e:
         raise TypeError(f"EvalConfig 构造失败（检查 YAML eval 段）: {e}") from e
 
+    try:
+        swanlab_cfg = SwanLabConfig(**config_dict["swanlab"])
+    except TypeError as e:
+        raise TypeError(f"SwanLabConfig 构造失败（检查 YAML swanlab 段）: {e}") from e
+
     return Config(
         model=model_cfg,
         router=router_cfg,
@@ -383,6 +416,7 @@ def _dict_to_config(config_dict: Dict[str, Any]) -> Config:
         data=data_cfg,
         paths=paths_cfg,
         eval=eval_cfg,
+        swanlab=swanlab_cfg,
     )
 
 
