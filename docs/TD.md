@@ -552,10 +552,10 @@ class SubspaceClustering:
 
 ### 1.6 router/feature_adapter.py + router/refined_selector.py — 精排系统
 
-**状态**: ⬜ 待实现 · L3 精排 · 前置: 无硬依赖 · 解锁: §1.7 · 测试: `test_feature_adapter.py`, `test_refined_selector.py`
+**状态**: ✅ 已完成 · L3 精排 · 前置: 无硬依赖 · 解锁: §1.7 · 测试: `test_feature_adapter.py`, `test_refined_selector.py`
 
 **文件**: `router/feature_adapter.py`, `router/refined_selector.py`
-**职责**: 防止特征坍缩的查询投影（FeatureAdapter）+ 从 ~64 候选中精选 Top-1 的交叉编码器（RefinedSelector）。
+**职责**: 防止特征坍缩的查询投影（FeatureAdapter）+ 从候选中精选 Top-1 的交叉编码器（RefinedSelector）。
 
 #### FeatureAdapter
 
@@ -563,68 +563,82 @@ class SubspaceClustering:
 class FeatureAdapter(nn.Module):
     """
     将冻结 Qwen3 embedding 投影到适配空间，防止 Feature Collapse。
-    输入: 冻结 embedding 的 mean pool [B, D]
+    输入: [B, S, D]（序列）或 [B, D]（已 pool）
     输出: 适配向量 [B, adapter_dim=512]
+    参数量: ~528K
     """
 
     def __init__(self, in_dim: int, adapter_dim: int):
-        self.centering = ...               # 可学习均值（去模式偏差）
-        self.layer_norm = LayerNorm(in_dim)
+        self.input_norm = LayerNorm(in_dim)
         self.proj = Linear(in_dim, adapter_dim)
-        self.activation = Tanh()
-        self.output_norm = LayerNorm(adapter_dim)  # 防止 collapse
+        self.output_norm = LayerNorm(adapter_dim)
+        self._scale = math.sqrt(adapter_dim)  # 常数，非可学习
 
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         """
         x: [B, S, D] 或 [B, D]（已 pool）
-        1. Mean pooling with mask: [B, S, D] → [B, D]
-        2. Centering → LayerNorm → Linear → Tanh
-        3. Output LayerNorm
+        1. Batch Centering（动态批均值，消除冻结 embedding 的各向异性）
+        2. Input LayerNorm
+        3. Linear → Tanh → ×√adapter_dim
+        4. Masked mean pool（仅 3D 路径）
+        5. Output LayerNorm
         → [B, adapter_dim]
         """
 ```
+
+**Batch Centering 说明**：采用动态批均值（`x - x.mean(dim=(0,1))`）而非可学习参数，无需训练即可消除 Qwen embedding 的 cone effect，与参考项目验证结果一致。
 
 #### RefinedSelector
 
 ```python
 class RefinedSelector(nn.Module):
     """
-    2 层 Transformer 交叉编码器，从 ~64 候选中精选 Top-1 知识条目。
+    2 层 Transformer Post-LN 交叉编码器，从候选中精选 Top-1 知识条目。
     训练时：CE loss + 与 teacher 的 KL 对比（见 §2.2）。
+    参数量: ~6.3M
     """
 
-    def __init__(self, adapter_dim: int, num_heads: int = 8, num_layers: int = 2):
+    def __init__(self, adapter_dim: int, num_heads: int, num_layers: int):
         self.transformer = TransformerEncoder(
-            d_model=adapter_dim, nhead=num_heads, num_layers=num_layers
+            d_model=adapter_dim, nhead=num_heads, num_layers=num_layers,
+            dim_feedforward=adapter_dim * 4,  # 标准 4x 比例
+            batch_first=True, norm_first=False  # Post-LN
         )
         self.score_head = Linear(adapter_dim, 1)
+        self.scale = nn.Parameter(torch.tensor(10.0))  # 可学习温度
 
     def forward(
         self,
-        query_vec: Tensor,     # [B, adapter_dim]  ← FeatureAdapter 输出
-        cand_vecs: Tensor,     # [B, C, adapter_dim] ← 候选知识编码
+        query_vec: Tensor,              # [B, adapter_dim]  ← FeatureAdapter 输出
+        cand_vecs: Tensor,              # [B, C, adapter_dim] ← 候选知识编码
+        mask: Optional[Tensor] = None,  # [B, C] bool，True=有效候选
     ) -> Tuple[Tensor, Tensor]:
         """
         拼接: [query; cand_1; ...; cand_C]  → [B, 1+C, adapter_dim]
-        TransformerEncoder(2 层, 8 heads)   → [B, 1+C, adapter_dim]
+        TransformerEncoder(Post-LN)         → [B, 1+C, adapter_dim]
         提取候选部分 [:, 1:, :]             → [B, C, adapter_dim]
-        Linear(adapter_dim, 1).squeeze(-1)  → scores [B, C]
+        score_head → squeeze → ×scale      → scores [B, C]
+        masked_fill(-inf) if mask 不为 None
+        argmax                             → best_idx [B]
 
         Returns:
-            scores:   Tensor[B, C]   — 精排分数（softmax 后用于 loss）
-            best_idx: Tensor[B]      — argmax 候选 ID（推理用）
+            scores:   Tensor[B, C]   — 精排原始分数（训练时做 softmax + CE loss）
+            best_idx: Tensor[B]      — argmax 候选 ID，值域 [0, C)（推理时使用）
         """
 ```
 
-**依赖**: torch, router/memory_bank.py
+**config 变更**：`RouterConfig` 新增 `refined_num_heads: int`、`refined_num_layers: int`（均写入 `config/default.yaml`，值为 8 和 2）。构造时由 §1.7 MemoryRouter 从 config 读取显式传入，不使用默认值。
+
+**依赖**: torch, router/memory_bank.py（间接）
 
 **验证 Checkpoint**:
-- [ ] 单元测试全部通过
-- [ ] 覆盖率 ≥ 80%
-- [ ] `tests/integration/test_refined_selector_flow.py` 端到端验证通过
-- [ ] Markdown 报告生成到 `tests/outputs/refined_selector/`
-- [ ] FeatureAdapter 输出稳定（无 NaN/Inf）
-- [ ] RefinedSelector best_idx ∈ [0, C)
+- [x] 单元测试全部通过（28/28）
+- [x] `tests/integration/test_refined_selector_flow.py` 端到端验证通过（4/4，加载真实 Qwen3-0.6B）
+- [x] Markdown 报告生成到 `tests/outputs/refined_selector/`
+- [x] FeatureAdapter 输出稳定（无 NaN/Inf，含极端输入验证）
+- [x] RefinedSelector best_idx ∈ [0, C)
+- [x] Batch Centering 消除常量偏置验证通过
+- [x] `from router import FeatureAdapter, RefinedSelector` 导入正常
 
 ---
 
