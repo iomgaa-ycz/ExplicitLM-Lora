@@ -279,7 +279,7 @@ class AttentionInjection(BaseInjection):
         # SDPA 的 attn_mask 约定：True=参与计算，False=忽略 → 取反
         # 使用 float mask：-inf 表示忽略
         attn_mask_float = torch.zeros(
-            B, 1, L, K + 1, dtype=hidden.dtype, device=hidden.device
+            B, 1, L, K + 1, dtype=Q.dtype, device=hidden.device
         )
         attn_mask_float = attn_mask_float.masked_fill(
             attn_mask_bool.unsqueeze(1).unsqueeze(2),  # [B, 1, 1, K_f+1]
