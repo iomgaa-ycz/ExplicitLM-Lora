@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Tuple, Union
 
@@ -100,6 +101,7 @@ class SubspaceClustering:
             )
 
         # Phase 2: PCA 旋转（np.linalg.eigh 对对称正半定矩阵更稳定）
+        t_pca = time.time()
         mean = embeddings.mean(axis=0).astype(np.float32)  # [D]
         x_c = embeddings.astype(np.float32) - mean  # [N, D]
         cov = (x_c.T @ x_c) / max(n - 1, 1)  # [D, D]
@@ -112,12 +114,14 @@ class SubspaceClustering:
 
         # PCA 旋转到主成分空间
         x_rot = x_c @ eigenvectors  # [N, D]
+        print(f"[Clustering] PCA 完成 ({time.time() - t_pca:.1f}s)")
 
         # Phase 3: 交错分割 → 两个正交子空间
         sub1 = x_rot[:, 0::2]  # [N, D//2] Row 子空间（偶数 PC）
         sub2 = x_rot[:, 1::2]  # [N, D//2] Col 子空间（奇数 PC）
 
         # Phase 4: 对两个子空间分别进行轴对齐递归二分聚类
+        t_bisect = time.time()
         row_labels, row_centroids = SubspaceClustering._recursive_bisect(sub1, num_keys)
         col_labels, col_centroids = SubspaceClustering._recursive_bisect(sub2, num_keys)
 
@@ -126,6 +130,7 @@ class SubspaceClustering:
         grid_sizes = np.bincount(grid_labels, minlength=num_keys * num_keys)
         max_cluster_size = int(grid_sizes.max())
         mean_cluster_size = float(grid_sizes.mean())
+        print(f"[Clustering] 递归二分完成 ({time.time() - t_bisect:.1f}s), max_cluster={max_cluster_size}, mean_cluster={mean_cluster_size:.1f}")
 
         return ClusteringResult(
             pca_matrix=eigenvectors,

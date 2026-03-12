@@ -16,9 +16,11 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+from tqdm import tqdm
 
 if TYPE_CHECKING:
     from config import RouterConfig
@@ -186,8 +188,9 @@ class AnchorBank:
             return torch.zeros((0,), dtype=torch.float, device=self.device)
 
         # Phase 2: 分 chunk 流式编码
+        n_chunks = (n_valid + chunk_size - 1) // chunk_size
         embeddings_list: List[torch.Tensor] = []
-        for start in range(0, n_valid, chunk_size):
+        for start in tqdm(range(0, n_valid, chunk_size), total=n_chunks, desc="[Recluster] 编码 AnchorBank", unit="batch"):
             end = min(start + chunk_size, n_valid)
             chunk_ids_idx = valid_indices[start:end]  # [chunk, ]
             chunk_token_ids = self.data[chunk_ids_idx]  # [chunk, K_a]
@@ -426,7 +429,7 @@ class DualKnowledgeStore:
             return False
         return (self.change_counter / n_valid) > self._config.recluster_threshold
 
-    def compact_and_recluster(self, encoder: "KnowledgeEncoder") -> None:
+    def compact_and_recluster(self, encoder: "KnowledgeEncoder", chunk_size: int = 512) -> None:
         """
         物理压缩 + 全量重聚类（重建所有索引）。
 
@@ -440,7 +443,8 @@ class DualKnowledgeStore:
         整个操作受 self._lock 保护，期间写操作被阻塞。
 
         参数：
-            encoder: KnowledgeEncoder 实例，用于编码 anchor_bank
+            encoder:    KnowledgeEncoder 实例，用于编码 anchor_bank
+            chunk_size: 编码时每批大小（默认 512，越大 GPU 利用率越高，越小越省显存）
 
         返回：
             None
@@ -450,6 +454,7 @@ class DualKnowledgeStore:
 
         with self._lock:
             # Phase 1: 收集 valid 条目索引并紧凑排列
+            t1 = time.time()
             valid_indices = torch.where(self.valid_mask)[0]  # [N_valid]
             n_valid = valid_indices.shape[0]
 
@@ -468,20 +473,28 @@ class DualKnowledgeStore:
             # 重建 valid_mask
             self.valid_mask.zero_()
             self.valid_mask[:n_valid] = True
+            print(f"[Recluster] Phase 1 紧凑排列完成，n_valid={n_valid} ({time.time() - t1:.1f}s)")
 
             # Phase 2: 全量编码（仅对有效条目）
+            t2 = time.time()
+            print(f"[Recluster] Phase 2 编码开始 (n={n_valid}, chunk_size={chunk_size}) ...")
             valid_mask_compact = self.valid_mask.clone()
             embeddings = self.anchor_bank.get_embeddings(
-                encoder, valid_mask_compact, chunk_size=64
+                encoder, valid_mask_compact, chunk_size=chunk_size
             )  # [N_valid, D]
+            print(f"[Recluster] Phase 2 编码完成 ({time.time() - t2:.1f}s)")
 
             # Phase 3: 独立子空间聚类
+            t3 = time.time()
+            print(f"[Recluster] Phase 3 子空间聚类开始 ...")
             embeddings_np = embeddings.cpu().float().numpy()
             result: "ClusteringResult" = SubspaceClustering.fit(
                 embeddings_np, self._num_keys
             )
+            print(f"[Recluster] Phase 3 聚类完成 ({time.time() - t3:.1f}s)")
 
             # Phase 4: 更新聚类状态
+            t4 = time.time()
             self.pca_matrix = torch.tensor(
                 result.pca_matrix, dtype=torch.float, device=self.device
             )
@@ -507,6 +520,7 @@ class DualKnowledgeStore:
                 torch.arange(n_valid, dtype=torch.long, device=self.device),
                 grid_indices,
             )
+            print(f"[Recluster] Phase 4-5 索引重建完成，max_cluster={result.max_cluster_size} ({time.time() - t4:.1f}s)")
 
             # Phase 5: 重置计数器
             self.next_free = n_valid

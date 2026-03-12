@@ -151,11 +151,12 @@ class MemoryRouter(nn.Module):
 
         # ─── Step 3: KnowledgeEncoder + FeatureAdapter — 候选侧编码 ──────────────
         # 3a. 从 AnchorBank 取候选原文 token IDs：[B, C, K_a]
-        anchor_ids = store.anchor_bank.data[candidates]  # [B, C, K_a]
+        # anchor_bank.data 存储在 CPU；candidates 在 GPU，需先移到 CPU 再索引
+        anchor_ids = store.anchor_bank.data[candidates.cpu()]  # [B, C, K_a]，CPU
         K_a = anchor_ids.shape[2]
 
-        # 3b. 展平为 [B*C, K_a]，方便批量编码
-        flat_ids = anchor_ids.reshape(B * C, K_a)  # [B*C, K_a]
+        # 3b. 展平为 [B*C, K_a]，移回 GPU 供编码器使用
+        flat_ids = anchor_ids.reshape(B * C, K_a).to(query_embedding.device)  # [B*C, K_a]
 
         # 3c. 构造 attention mask（0=pad，1=有效）
         flat_mask = (flat_ids != 0).long()  # [B*C, K_a]

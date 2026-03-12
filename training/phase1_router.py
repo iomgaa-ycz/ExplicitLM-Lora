@@ -39,9 +39,13 @@ import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
+from datetime import timedelta
+
 from accelerate import Accelerator
+from accelerate.utils import InitProcessGroupKwargs
 
 if TYPE_CHECKING:
     from config import Config
@@ -158,7 +162,8 @@ def tokenize_parquet_batch(
     anchor_ids = torch.zeros(N, anchor_length, dtype=torch.long)
     fusion_ids = torch.zeros(N, fusion_length, dtype=torch.long)
 
-    for start in range(0, N, batch_size):
+    n_batches = (N + batch_size - 1) // batch_size
+    for start in tqdm(range(0, N, batch_size), total=n_batches, desc="[Phase A] Tokenize", unit="batch"):
         end = min(start + batch_size, N)
         chunk = rows[start:end]
 
@@ -522,12 +527,16 @@ def run_phase_a(
         rows:         原始 dict 列表（含 text/compressed_text，Phase B 可复用）
     """
     N = cfg.router.knowledge_num
+    chunk_size = cfg.data.phase1_recluster_chunk_size
 
     # ── Step 1: 采样文本 ──
+    t0 = time.time()
     rows = sampler.sample_epoch_data(seed=epoch)
     assert len(rows) == N, f"Phase A 采样数量不符：期望 {N}，实际 {len(rows)}"
+    print(f"[Phase A 1/6] 采样完成：{N} 条 ({time.time() - t0:.1f}s)")
 
     # ── Step 2: tokenize ──
+    t0 = time.time()
     anchor_ids, fusion_ids = tokenize_parquet_batch(
         rows,
         tokenizer,
@@ -536,22 +545,29 @@ def run_phase_a(
         batch_size=cfg.data.phase1_tokenize_batch_size,
     )
     # anchor_ids: [N, 128], fusion_ids: [N, 64]
+    print(f"[Phase A 2/6] Tokenize 完成 ({time.time() - t0:.1f}s)")
 
     # ── Step 3: 更新双 Bank（全量覆盖，Phase 1 每 epoch 重新采样）──
     store.fusion_bank.update_all(fusion_ids)
     store.anchor_bank.update_all(anchor_ids)
     store.valid_mask[:N] = True
     store.next_free = N
+    print(f"[Phase A 3/6] Bank 更新完成")
 
     # ── Step 4: 全量重聚类（编码 anchor → 子空间聚类 → 重建倒排索引）──
-    store.compact_and_recluster(encoder)
+    t0 = time.time()
+    print(f"[Phase A 4/6] 开始 compact_and_recluster (chunk_size={chunk_size}) ...")
+    store.compact_and_recluster(encoder, chunk_size=chunk_size)
+    print(f"[Phase A 4/6] compact_and_recluster 完成 ({time.time() - t0:.1f}s)")
 
     # ── Step 5: 更新 PKM Keys（必须在 recluster 之后，row/col centroids 已刷新）──
     assert store.row_centroids is not None, "recluster 后 row_centroids 不应为 None"
     router.pkm.update_keys(store.row_centroids, store.col_centroids)
+    print(f"[Phase A 5/6] PKM Keys 更新完成")
 
     # ── Step 6: 构建 id_to_rowcol 映射 ──
     id_to_rowcol = store.get_rowcol_labels()  # [N, 2]
+    print(f"[Phase A 6/6] id_to_rowcol 构建完成")
 
     # ── Step 7: 释放 tokenize 临时张量 ──
     del fusion_ids
@@ -746,8 +762,11 @@ def broadcast_store_state(
         - store.inverted_index[:n]
         - store.cluster_offsets
         - store.cluster_counts
-        - store.row_centroids / col_centroids
         - id_to_rowcol [n, 2]
+
+    注意：row_centroids / col_centroids 不在此广播——它们通过
+    router.pkm.row_keys / col_keys（register_buffer）在 train_phase1() 中单独广播，
+    以避免非主进程 row_centroids=None 导致的非对称 skip 死锁。
 
     参数：
         accelerator:  Accelerate 加速器
@@ -783,40 +802,18 @@ def broadcast_store_state(
         if not accelerator.is_main_process:
             obj[:n].copy_(buf)
 
+    # 仅广播始终非 None、shape 固定的三个属性；row/col centroids 通过 PKM keys 在外部广播
     for attr, shape, dtype in [
         ("inverted_index", (n,), torch.long),
         ("cluster_offsets", (num_keys_sq + 1,), torch.long),
         ("cluster_counts", (num_keys_sq,), torch.long),
-        (
-            "row_centroids",
-            (
-                store._num_keys,
-                store.row_centroids.shape[1] if store.row_centroids is not None else 1,
-            ),
-            torch.float,
-        ),
-        (
-            "col_centroids",
-            (
-                store._num_keys,
-                store.col_centroids.shape[1] if store.col_centroids is not None else 1,
-            ),
-            torch.float,
-        ),
     ]:
         src = getattr(store, attr)
-        if src is None:
-            continue
-        if attr in ("inverted_index",):
-            src_slice = src[:n]
-        else:
-            src_slice = src
+        src_slice = src[:n] if attr == "inverted_index" else src
         if accelerator.is_main_process:
             buf = src_slice.to(dev)
         else:
-            buf = torch.zeros(
-                shape if attr != "inverted_index" else (n,), dtype=dtype, device=dev
-            )
+            buf = torch.zeros(shape, dtype=dtype, device=dev)
         dist.broadcast(buf, src=0)
         if not accelerator.is_main_process:
             if attr == "inverted_index":
@@ -869,9 +866,12 @@ def train_phase1(cfg: "Config", device_str: str = "cpu") -> None:
         AssertionError:    数据采样量不足 knowledge_num
     """
     # ── Phase 1: Accelerate 初始化 ──
+    # Phase A 仅主进程执行（编码 1M 条约 8 分钟），扩大 NCCL 超时至 2 小时避免 rank 1 空等被杀
+    _nccl_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=2))
     accelerator = Accelerator(
         gradient_accumulation_steps=cfg.train.phase1_gradient_accumulation_steps,
         mixed_precision="bf16" if cfg.train.bf16 else "no",
+        kwargs_handlers=[_nccl_kwargs],
     )
     device = accelerator.device
 
@@ -916,6 +916,8 @@ def train_phase1(cfg: "Config", device_str: str = "cpu") -> None:
 
     # Accelerate prepare（router + optimizer；encoder 已手动 .to(device)，不走 prepare）
     router, optimizer = accelerator.prepare(router, optimizer)
+    # 一次解包，全局复用：DDP-wrapped router 仅用于梯度同步，属性访问和 forward 均用 unwrapped_router
+    unwrapped_router = accelerator.unwrap_model(router)
 
     # ── Phase 3: 数据采样器 ──
     sampler = ParquetEpochSampler(
@@ -948,7 +950,7 @@ def train_phase1(cfg: "Config", device_str: str = "cpu") -> None:
         if accelerator.is_main_process:
             print(f"[Phase1] Epoch {epoch} — Phase A: 采样 + 重聚类")
             id_to_rowcol, anchor_ids, _ = run_phase_a(
-                epoch, sampler, store, encoder, router, cfg, tokenizer
+                epoch, sampler, store, encoder, unwrapped_router, cfg, tokenizer
             )
             id_to_rowcol = id_to_rowcol.to(device)
             anchor_ids_dev = anchor_ids  # 保持 CPU，Dataset 直接用
@@ -958,13 +960,18 @@ def train_phase1(cfg: "Config", device_str: str = "cpu") -> None:
 
         # ── 多卡广播 store 状态 ──
         id_to_rowcol = broadcast_store_state(accelerator, store, id_to_rowcol, N)
-        # 非主进程 anchor_ids 同步
-        anchor_ids_dev = _broadcast_tensor(
-            accelerator,
-            anchor_ids_dev if accelerator.is_main_process else None,
-            (N, cfg.model.anchor_length),
-            torch.long,
-        ).cpu()
+        # 广播 PKM 聚类 Keys（register_buffer，永不为 None；rank 0 已在 run_phase_a 中 update_keys）
+        if accelerator.num_processes > 1:
+            import torch.distributed as dist
+            dist.barrier()
+            dist.broadcast(unwrapped_router.pkm.row_keys, src=0)
+            dist.broadcast(unwrapped_router.pkm.col_keys, src=0)
+            dist.barrier()
+        # anchor_ids_dev 无需单独广播：anchor_bank 已在 broadcast_store_state 中同步
+        # 对标参考项目（train_router.py）：所有 rank 直接从已广播的 store buffer 读取
+        anchor_ids_dev = store.anchor_bank.data[:N].cpu()
+        # 与参考项目对齐：广播全部完成后等待所有 rank 就绪再进 Phase B
+        accelerator.wait_for_everyone()
 
         # ── Phase B: 路由训练 ──
         router.train()
@@ -983,8 +990,6 @@ def train_phase1(cfg: "Config", device_str: str = "cpu") -> None:
         epoch_kl_sum = 0.0
         epoch_fine_sum = 0.0
         n_batches = 0
-
-        unwrapped_router = accelerator.unwrap_model(router)
 
         for batch in loader:
             anchor_ids_b = batch["anchor_ids"].to(device)  # [B, L]

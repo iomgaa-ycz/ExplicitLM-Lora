@@ -88,7 +88,7 @@ data:
   # Phase 1 tokenize 批大小（tokenize text/compressed_text 时的批大小）
   phase1_tokenize_batch_size: 10000
   # Phase 1 重聚类时 encoder 编码的分块大小（避免 OOM）
-  phase1_recluster_chunk_size: 64
+  phase1_recluster_chunk_size: 512
 
 paths:
   # 基础模型权重目录（可被 .env 中的 MODEL_PATH 覆盖为绝对路径）
