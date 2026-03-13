@@ -32,7 +32,7 @@ router:
   # FeatureAdapter 中间维度
   adapter_dim: 512
   # 粗排候选条目数（从 PKM Top-N 候选中进行精排）
-  num_candidates: 32
+  num_candidates: 256
   # PKM softmax 温度参数（越低越尖锐）
   temperature: 0.1
   # 触发重新聚类的变更比例阈值（变更条目数 / 总条目数 > 此值则重聚类）
@@ -46,10 +46,10 @@ router:
 
 train:
   # Phase 1: Router 训练（PKM + FeatureAdapter + RefinedSelector）
-  phase1_lr: 1.0e-3
-  phase1_batch_size: 64
-  phase1_max_epochs: 3
-  phase1_warmup_steps: 200
+  phase1_lr: 5.0e-4
+  phase1_batch_size: 72
+  phase1_max_epochs: 20
+  phase1_warmup_steps: 2000
 
   # Phase 2: Fusion 预训练（AttentionInjection × 4 + KnowledgeEncoder，FineWeb-Edu）
   phase2_lr: 3.0e-4
@@ -113,6 +113,8 @@ swanlab:
   log_every_n_steps: 50
   # Phase 1 每隔多少步打印 acc/row_acc/col_acc 并上报 SwanLab
   phase1_log_acc_steps: 1000
+  # Phase 1 step 级别 row/col recall 使用的 top-K（对齐参考项目 refine_top_k=8）
+  phase1_log_recall_k: 8
 
 eval:
   # MedQA 知识映射文件（question → compressed_knowledge）

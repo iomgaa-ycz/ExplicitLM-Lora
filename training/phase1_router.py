@@ -294,37 +294,42 @@ def compute_teacher_logits(
     """
     用 anchor embedding 计算 teacher 软标签（知识自身与 cluster centroids 的相似度）。
 
-    Teacher 代表"理想路由"：知道完整的 anchor embedding 后对各 cluster 的归属概率。
-    Student 的 KL loss 以此为目标，引导 PKM 学习更贴近理想分布的投影。
+    ISN Teacher（Independent Subspace Normalization）：
+    直接将 anchor embedding 前后各半作为子空间，与 cluster centroids 点积，
+    完全不经过任何可训练投影层，对齐参考项目 MemoryGate 的 teacher 设计。
+
+    Student 路径：anchor_emb → query_proj（可训练）→ key_proj → scores
+    Teacher 路径：anchor_emb[:, :D//2] → F.normalize → row_keys（non-trainable）→ logits
+    因此 KL(student || teacher) != 0，提供真实梯度信号。
 
     参数：
         anchor_emb: [B, D] — frozen encoder 输出的 anchor 文本 embedding
-        pkm:        ProductKeyMemory 实例（含 query_proj, row/col key_proj, keys）
+        pkm:        ProductKeyMemory 实例（含 row_keys/col_keys non-trainable buffer）
         temperature: PKM softmax 温度（与训练时保持一致）
 
     返回：
         teacher_logits_1: [B, num_keys] — row cluster logits（未 softmax）
         teacher_logits_2: [B, num_keys] — col cluster logits（未 softmax）
-
-    实现细节：
-        复用 PKM 的投影层（query_proj → chunk → key_proj → L2norm → 点积），
-        仅用 @torch.no_grad() 包裹，不影响反向传播路径
     """
-    # Phase 1: query 侧投影（与 PKM.forward 保持完全一致的计算路径）
-    q = pkm.query_proj(anchor_emb)  # [B, query_dim]
-    q1, q2 = q.chunk(2, dim=-1)  # [B, key_proj_dim] × 2
-    q1 = F.normalize(q1, p=2, dim=-1)
-    q2 = F.normalize(q2, p=2, dim=-1)
+    # Phase 1: ISN（Independent Subspace Normalization）
+    # 直接切分 anchor embedding 前后各半，对应 Row/Col 子空间
+    # 与 SubspaceClustering.fit() 的交错分割保持一致（偶数 PC → Row，奇数 PC → Col），
+    # 但此处 anchor_emb 是原始 encoder 输出（未经 PCA 旋转），直接前后切分
+    D = anchor_emb.shape[-1]
+    sub1 = F.normalize(anchor_emb[:, : D // 2], p=2, dim=-1)  # [B, D//2]
+    sub2 = F.normalize(anchor_emb[:, D // 2 :], p=2, dim=-1)  # [B, D//2]
 
-    # Phase 2: key 侧投影 + L2 归一化
-    k1 = F.normalize(
-        pkm.row_key_proj(pkm.row_keys), p=2, dim=-1
+    # Phase 2: cluster centroids（non-trainable buffer），不经过任何可训练投影层
+    row_cent = F.normalize(
+        pkm.row_keys.to(dtype=anchor_emb.dtype), p=2, dim=-1
     )  # [num_keys, key_proj_dim]
-    k2 = F.normalize(pkm.col_key_proj(pkm.col_keys), p=2, dim=-1)
+    col_cent = F.normalize(
+        pkm.col_keys.to(dtype=anchor_emb.dtype), p=2, dim=-1
+    )  # [num_keys, key_proj_dim]
 
-    # Phase 3: 温度缩放点积 → teacher logits
-    teacher_logits_1 = q1 @ k1.T / temperature  # [B, num_keys]
-    teacher_logits_2 = q2 @ k2.T / temperature  # [B, num_keys]
+    # Phase 3: 温度缩放点积 → teacher logits（完全无可训练参数，KL != 0）
+    teacher_logits_1 = sub1 @ row_cent.T / temperature  # [B, num_keys]
+    teacher_logits_2 = sub2 @ col_cent.T / temperature  # [B, num_keys]
 
     return teacher_logits_1, teacher_logits_2
 
@@ -365,6 +370,7 @@ def compute_router_loss(
     teacher_logits_2: torch.Tensor,
     target_local_idx: torch.Tensor,
     alpha: float = 0.2,
+    temperature: float = 0.1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     计算 Router 完整训练损失。
@@ -378,10 +384,11 @@ def compute_router_loss(
         out:              RouterOutput（含 coarse_scores 和 fine_scores）
         target_row:       [B] long — 粗排目标 row cluster
         target_col:       [B] long — 粗排目标 col cluster
-        teacher_logits_1: [B, num_keys] — teacher row logits（未 softmax）
-        teacher_logits_2: [B, num_keys] — teacher col logits（未 softmax）
+        teacher_logits_1: [B, num_keys] — teacher row logits（未 softmax，已内含 /temperature）
+        teacher_logits_2: [B, num_keys] — teacher col logits（未 softmax，已内含 /temperature）
         target_local_idx: [B] long — 精排目标局部索引（-100=未命中）
         alpha:            KL 蒸馏权重（默认 0.2）
+        temperature:      softmax 温度，CE 和 KL student 均除以此值（对齐参考项目）
 
     返回：
         total_loss:  scalar — 总损失（用于 backward）
@@ -391,14 +398,17 @@ def compute_router_loss(
     """
     scores_1, scores_2 = out.coarse_scores  # [B, num_keys] × 2
 
-    # Phase 1: 粗排 CE（行 + 列）
-    ce_row = F.cross_entropy(scores_1, target_row)
-    ce_col = F.cross_entropy(scores_2, target_col)
+    # Phase 1: 粗排 CE（行 + 列），除以 temperature 对齐参考项目
+    ce_row = F.cross_entropy(scores_1 / temperature, target_row)
+    ce_col = F.cross_entropy(scores_2 / temperature, target_col)
     ce_loss = ce_row + ce_col
 
     # Phase 2: KL 蒸馏（student log_softmax vs teacher softmax）
-    log_row = F.log_softmax(scores_1, dim=-1)
-    log_col = F.log_softmax(scores_2, dim=-1)
+    # student 也除以 temperature，确保 student 分布与 teacher 分布在相同温度标度下
+    # 修复前：student T=1.0，teacher T=0.1 → KL 常驻 6+，不随训练收敛
+    # 修复后：两者均 T=0.1 → 学生学好后 KL → 0，梯度自然衰减
+    log_row = F.log_softmax(scores_1 / temperature, dim=-1)
+    log_col = F.log_softmax(scores_2 / temperature, dim=-1)
     teacher_prob_1 = F.softmax(teacher_logits_1, dim=-1)
     teacher_prob_2 = F.softmax(teacher_logits_2, dim=-1)
     kl_loss = F.kl_div(log_row, teacher_prob_1, reduction="batchmean") + F.kl_div(
@@ -438,12 +448,12 @@ def evaluate_recall_at_k(
     device: torch.device,
     Ks: List[int] = None,
     max_eval_samples: int = 1000,
-) -> Dict[int, float]:
+) -> Tuple[Dict[int, float], float]:
     """
-    计算 Router 的 Recall@K 指标（K=1,4,16）。
+    计算 Router 的 Recall@K 指标（K=1,4,16）及 RefinedSelector 精排准确率。
 
     对 dataset 中的样本：将 anchor_ids 作为 query，调用 router.forward()，
-    检查 ground truth entry_id 是否在 top-K candidates 中。
+    检查 ground truth entry_id 是否在 top-K candidates 中，以及 best_id 是否直接命中。
 
     参数：
         router:           MemoryRouter 实例（eval 模式）
@@ -455,7 +465,10 @@ def evaluate_recall_at_k(
         max_eval_samples: 最多评估的样本数（避免全量评估过慢）
 
     返回：
-        Dict[int, float]，key=K，value=Recall@K（0.0~1.0）
+        (Dict[int, float], float, float)
+            - Dict: key=K，value=Recall@K（0.0~1.0）
+            - float: fine_acc，RefinedSelector best_id == ground truth 的端到端准确率
+            - float: cond_fine_acc，在 GT ∈ candidates 条件下 best_id 命中率（精排纯选择能力）
     """
     if Ks is None:
         Ks = [1, 4, 16]
@@ -464,6 +477,9 @@ def evaluate_recall_at_k(
     n_eval = min(max_eval_samples, len(dataset))
 
     hits: Dict[int, int] = {k: 0 for k in Ks}
+    fine_hits = 0
+    cond_fine_hits = 0  # best_id == GT 且 GT ∈ candidates
+    cond_total = 0      # GT ∈ candidates 的样本数（精排的分母）
     total = 0
 
     loader = DataLoader(dataset, batch_size=64, shuffle=False, num_workers=0)
@@ -483,14 +499,24 @@ def evaluate_recall_at_k(
         for b in range(batch_size):
             if total >= n_eval:
                 break
+            gt_in_cands = bool((candidates[b] == entry_ids[b]).any().item())
             for k in Ks:
                 if entry_ids[b] in candidates[b, :k]:
                     hits[k] += 1
+            hit = bool((out.best_id[b] == entry_ids[b]).item())
+            if hit:
+                fine_hits += 1
+            if gt_in_cands:
+                cond_total += 1
+                if hit:
+                    cond_fine_hits += 1
             total += 1
 
     del loader
     recall = {k: hits[k] / total for k in Ks} if total > 0 else {k: 0.0 for k in Ks}
-    return recall
+    fine_acc = fine_hits / total if total > 0 else 0.0
+    cond_fine_acc = cond_fine_hits / cond_total if cond_total > 0 else 0.0
+    return recall, fine_acc, cond_fine_acc
 
 
 # ─────────────────────────────────────────────────────
@@ -984,7 +1010,7 @@ def train_phase1(cfg: "Config", device_str: str = "cpu") -> None:
     )
     scheduler = accelerator.prepare(scheduler)
 
-    best_recall1 = 0.0
+    best_fine_acc = 0.0
     global_step = 0
     N = cfg.router.knowledge_num
 
@@ -1036,6 +1062,11 @@ def train_phase1(cfg: "Config", device_str: str = "cpu") -> None:
         epoch_acc_sum = 0.0
         epoch_row_acc_sum = 0.0
         epoch_col_acc_sum = 0.0
+        epoch_fine_acc_sum = 0.0
+        epoch_cond_fine_acc_sum = 0.0
+        epoch_row_recall_sum = 0.0
+        epoch_col_recall_sum = 0.0
+        epoch_recall_256_sum = 0.0
         n_batches = 0
 
         for batch in loader:
@@ -1071,6 +1102,7 @@ def train_phase1(cfg: "Config", device_str: str = "cpu") -> None:
                     teacher_log1,
                     teacher_log2,
                     target_local,
+                    temperature=cfg.router.temperature,
                 )
 
                 accelerator.backward(loss)
@@ -1080,12 +1112,31 @@ def train_phase1(cfg: "Config", device_str: str = "cpu") -> None:
                 optimizer.zero_grad(set_to_none=True)
 
             # 粗排准确率（PKM coarse_scores argmax 与 target 比较）
+            # 精排准确率（RefinedSelector best_id 与 ground truth 比较）
             with torch.no_grad():
                 pred_row = out.coarse_scores[0].argmax(dim=-1)  # [B]
                 pred_col = out.coarse_scores[1].argmax(dim=-1)  # [B]
                 row_acc = (pred_row == target_row_b).float().mean()
                 col_acc = (pred_col == target_col_b).float().mean()
                 acc = ((pred_row == target_row_b) & (pred_col == target_col_b)).float().mean()
+                fine_acc = (out.best_id == entry_ids_b).float().mean()
+                # 对齐参考项目：top-K row recall 和 top-K col recall（独立，非联合）
+                _K = cfg.swanlab.phase1_log_recall_k
+                row_recall = (
+                    out.coarse_scores[0].topk(_K, dim=-1).indices == target_row_b.unsqueeze(1)
+                ).any(dim=1).float().mean()
+                col_recall = (
+                    out.coarse_scores[1].topk(_K, dim=-1).indices == target_col_b.unsqueeze(1)
+                ).any(dim=1).float().mean()
+                # 向量化计算条件精排准确率（O(B×C)，无 Python 循环）
+                gt_in_cands = (out.candidates == entry_ids_b.unsqueeze(1)).any(dim=1)  # [B] bool
+                recall_256 = gt_in_cands.float().mean()  # GT 落入 256 候选集的比例
+                cond_denom = gt_in_cands.sum().float()
+                cond_fine_acc = (
+                    ((out.best_id == entry_ids_b) & gt_in_cands).sum().float() / cond_denom
+                    if cond_denom.item() > 0
+                    else torch.zeros(1, device=device).squeeze()
+                )
 
             global_step += 1
             epoch_loss_sum += float(loss.detach())
@@ -1095,6 +1146,11 @@ def train_phase1(cfg: "Config", device_str: str = "cpu") -> None:
             epoch_acc_sum += float(acc)
             epoch_row_acc_sum += float(row_acc)
             epoch_col_acc_sum += float(col_acc)
+            epoch_fine_acc_sum += float(fine_acc)
+            epoch_cond_fine_acc_sum += float(cond_fine_acc)
+            epoch_row_recall_sum += float(row_recall)
+            epoch_col_recall_sum += float(col_recall)
+            epoch_recall_256_sum += float(recall_256)
             n_batches += 1
 
             # 定步上报（swanlab）
@@ -1116,11 +1172,20 @@ def train_phase1(cfg: "Config", device_str: str = "cpu") -> None:
                 avg_acc = epoch_acc_sum / n_batches
                 avg_row_acc = epoch_row_acc_sum / n_batches
                 avg_col_acc = epoch_col_acc_sum / n_batches
+                avg_fine_acc = epoch_fine_acc_sum / n_batches
+                avg_cond_fine_acc = epoch_cond_fine_acc_sum / n_batches
                 avg_step_loss = epoch_loss_sum / n_batches
+                avg_row_recall = epoch_row_recall_sum / n_batches
+                avg_col_recall = epoch_col_recall_sum / n_batches
+                avg_recall_256 = epoch_recall_256_sum / n_batches
+                _K = cfg.swanlab.phase1_log_recall_k
                 print(
                     f"[Step {global_step}] loss={avg_step_loss:.4f} "
                     f"ce={epoch_ce_sum / n_batches:.4f} kl={epoch_kl_sum / n_batches:.4f} "
-                    f"| acc={avg_acc:.4f} row_acc={avg_row_acc:.4f} col_acc={avg_col_acc:.4f}"
+                    f"| acc={avg_acc:.4f} row_acc={avg_row_acc:.4f} col_acc={avg_col_acc:.4f} "
+                    f"row_recall@{_K}={avg_row_recall:.4f} col_recall@{_K}={avg_col_recall:.4f} "
+                    f"recall@256={avg_recall_256:.4f} "
+                    f"fine_acc={avg_fine_acc:.4f} cond_fine_acc={avg_cond_fine_acc:.4f}"
                 )
                 log_swanlab(
                     accelerator,
@@ -1130,9 +1195,19 @@ def train_phase1(cfg: "Config", device_str: str = "cpu") -> None:
                         "train/step_acc": float(acc),
                         "train/step_row_acc": float(row_acc),
                         "train/step_col_acc": float(col_acc),
+                        "train/step_row_recall": float(row_recall),
+                        "train/step_col_recall": float(col_recall),
+                        "train/step_recall_256": float(recall_256),
+                        "train/step_fine_acc": float(fine_acc),
+                        "train/step_cond_fine_acc": float(cond_fine_acc),
                         "train/avg_acc": avg_acc,
                         "train/avg_row_acc": avg_row_acc,
                         "train/avg_col_acc": avg_col_acc,
+                        "train/avg_row_recall": avg_row_recall,
+                        "train/avg_col_recall": avg_col_recall,
+                        "train/avg_recall_256": avg_recall_256,
+                        "train/avg_fine_acc": avg_fine_acc,
+                        "train/avg_cond_fine_acc": avg_cond_fine_acc,
                     },
                 )
 
@@ -1147,7 +1222,12 @@ def train_phase1(cfg: "Config", device_str: str = "cpu") -> None:
         avg_acc = epoch_acc_sum / n_b
         avg_row_acc = epoch_row_acc_sum / n_b
         avg_col_acc = epoch_col_acc_sum / n_b
-        recall = evaluate_recall_at_k(
+        avg_fine_acc = epoch_fine_acc_sum / n_b
+        avg_cond_fine_acc = epoch_cond_fine_acc_sum / n_b
+        avg_row_recall = epoch_row_recall_sum / n_b
+        avg_col_recall = epoch_col_recall_sum / n_b
+        avg_recall_256 = epoch_recall_256_sum / n_b
+        recall, eval_fine_acc, eval_cond_fine_acc = evaluate_recall_at_k(
             unwrapped_router, store, dataset, encoder, device, Ks=[1, 4, 16]
         )
         del dataset
@@ -1156,8 +1236,11 @@ def train_phase1(cfg: "Config", device_str: str = "cpu") -> None:
         if accelerator.is_main_process:
             print(
                 f"[Phase1] Epoch {epoch} | loss={avg_loss:.4f} "
-                f"| acc={avg_acc:.4f} row_acc={avg_row_acc:.4f} col_acc={avg_col_acc:.4f} "
+                f"| acc={avg_acc:.4f} row_acc={avg_row_acc:.4f} col_acc={avg_col_acc:.4f} fine_acc={avg_fine_acc:.4f} cond_fine_acc={avg_cond_fine_acc:.4f} "
+                f"| row_recall@{cfg.swanlab.phase1_log_recall_k}={avg_row_recall:.4f} col_recall@{cfg.swanlab.phase1_log_recall_k}={avg_col_recall:.4f} recall@256={avg_recall_256:.4f} "
                 f"| Recall@1={recall[1]:.4f} @4={recall[4]:.4f} @16={recall[16]:.4f} "
+                f"| eval_fine_acc={eval_fine_acc:.4f}  eval_cond_fine_acc={eval_cond_fine_acc:.4f} "
+                f"| Δ_vs_Recall1={eval_fine_acc - recall[1]:+.4f}  upper_bound={recall[16]:.4f} "
                 f"| {t_elapsed:.1f}s"
             )
 
@@ -1173,16 +1256,24 @@ def train_phase1(cfg: "Config", device_str: str = "cpu") -> None:
                     "train/epoch_acc": avg_acc,
                     "train/epoch_row_acc": avg_row_acc,
                     "train/epoch_col_acc": avg_col_acc,
+                    "train/epoch_fine_acc": avg_fine_acc,
+                    "train/epoch_cond_fine_acc": avg_cond_fine_acc,
+                    "train/epoch_row_recall": avg_row_recall,
+                    "train/epoch_col_recall": avg_col_recall,
+                    "train/epoch_recall_256": avg_recall_256,
                     "eval/recall@1": recall[1],
                     "eval/recall@4": recall[4],
                     "eval/recall@16": recall[16],
+                    "eval/fine_acc": eval_fine_acc,
+                    "eval/cond_fine_acc": eval_cond_fine_acc,
+                    "eval/fine_acc_delta_vs_recall1": eval_fine_acc - recall[1],
                     "train/epoch": epoch,
                 },
             )
 
-            is_best = recall[1] > best_recall1
+            is_best = eval_fine_acc > best_fine_acc
             if is_best:
-                best_recall1 = recall[1]
+                best_fine_acc = eval_fine_acc
             save_checkpoint(
                 accelerator, router, store, epoch, recall, cfg, best=is_best
             )
@@ -1191,4 +1282,4 @@ def train_phase1(cfg: "Config", device_str: str = "cpu") -> None:
         torch.cuda.empty_cache()
 
     if accelerator.is_main_process:
-        print(f"[Phase1] 训练完成，best Recall@1={best_recall1:.4f}")
+        print(f"[Phase1] 训练完成，best fine_acc={best_fine_acc:.4f}")

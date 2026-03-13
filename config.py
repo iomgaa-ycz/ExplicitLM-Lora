@@ -185,12 +185,14 @@ class SwanLabConfig:
         enabled: 是否启用 SwanLab 追踪（False 时跳过所有 swanlab 调用）
         log_every_n_steps: 每隔多少训练步上报一次指标
         phase1_log_acc_steps: Phase 1 每隔多少步打印 acc/row_acc/col_acc 并上报 SwanLab
+        phase1_log_recall_k: step 级别 row/col recall 使用的 top-K（对齐参考项目 refine_top_k=8）
     """
 
     project: str
     enabled: bool
     log_every_n_steps: int
     phase1_log_acc_steps: int  # 每多少 step 打印 acc/row_acc/col_acc 并上报 SwanLab
+    phase1_log_recall_k: int  # step 级别 row/col recall 使用的 top-K，对齐参考项目 refine_top_k=8
 
 
 @dataclass

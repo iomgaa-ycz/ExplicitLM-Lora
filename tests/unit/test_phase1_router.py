@@ -189,7 +189,8 @@ def test_compute_router_loss_backward():
     target_local_idx = torch.randint(0, C, (B,))
 
     total, ce, kl, fine = compute_router_loss(
-        out, target_row, target_col, teacher_log1, teacher_log2, target_local_idx
+        out, target_row, target_col, teacher_log1, teacher_log2, target_local_idx,
+        temperature=0.1,
     )
 
     assert total.ndim == 0, "total_loss 应为标量"
@@ -202,6 +203,31 @@ def test_compute_router_loss_backward():
     total.backward()
     assert coarse_1.grad is not None, "coarse_1 未收到梯度"
     assert fine_scores.grad is not None, "fine_scores 未收到梯度"
+
+
+# ─────────────────────────────────────────────────────
+# 测试 4b: compute_router_loss — KL 收敛验证
+# ─────────────────────────────────────────────────────
+
+
+def test_compute_router_loss_kl_convergence():
+    """
+    修复后（CE 和 KL student 均除以 temperature），当学生分布与 teacher 完全对齐时
+    KL loss 应接近 0。修复前（student T=1.0，teacher T=0.1）此条件永远无法满足。
+    """
+    import torch.nn.functional as F
+
+    B, K, T = 4, 32, 0.1
+    # 学生和 teacher 都强烈指向 cluster 0（模拟训练收敛后的理想状态）
+    scores = torch.zeros(B, K)
+    scores[:, 0] = 10.0
+    # teacher logits 已内含 /T（与 compute_teacher_logits 输出格式一致）
+    teacher_logits = torch.zeros(B, K)
+    teacher_logits[:, 0] = 10.0 / T
+
+    log_row = F.log_softmax(scores / T, dim=-1)
+    kl = F.kl_div(log_row, F.softmax(teacher_logits, dim=-1), reduction="batchmean")
+    assert kl.item() < 1e-3, f"对齐时 KL 应接近 0，实际 {kl.item():.6f}"
 
 
 # ─────────────────────────────────────────────────────
