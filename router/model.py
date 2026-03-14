@@ -24,7 +24,7 @@ router/model.py — MemoryRouter 端到端路由器
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -48,13 +48,15 @@ class RouterOutput:
         best_id:       [B] — 精排后最优知识条目的全局 ID（long）
         candidates:    [B, num_candidates] — 粗排输出的候选知识 ID（long）
         coarse_scores: (scores_1, scores_2) — PKM 行/列匹配分数，各 [B, num_keys]
-        fine_scores:   [B, num_candidates] — RefinedSelector 精排原始分数（未 softmax）
+        fine_scores:   [B, num_candidates] — RefinedSelector 精排原始分数（空位已打 -inf）
+        cand_mask:     [B, num_candidates] — bool，True=真实候选，False=空位
     """
 
     best_id: torch.Tensor
     candidates: torch.Tensor
     coarse_scores: Tuple[torch.Tensor, torch.Tensor]
     fine_scores: torch.Tensor
+    cand_mask: torch.Tensor
 
 
 class MemoryRouter(nn.Module):
@@ -113,20 +115,24 @@ class MemoryRouter(nn.Module):
         self,
         query_embedding: torch.Tensor,
         store: "DualKnowledgeStore",
+        target_entry_ids: Optional[torch.Tensor] = None,
     ) -> RouterOutput:
         """
         训练用完整前向传播，返回含分数的 RouterOutput 供损失计算。
 
         参数：
-            query_embedding: [B, D] — 问题的 Qwen3 embedding（D = config.dim）
-            store:           DualKnowledgeStore — 双存储库，提供倒排索引与 AnchorBank
+            query_embedding:  [B, D] — 问题的 Qwen3 embedding（D = config.dim）
+            store:            DualKnowledgeStore — 双存储库，提供倒排索引与 AnchorBank
+            target_entry_ids: [B] long，可选 — 训练时传入 GT 知识 ID，用于强制插入候选集
+                              确保精排损失对每条样本都有有效训练信号；推理时传 None
 
         返回：
             RouterOutput，包含：
                 best_id:       [B] long — 最优知识全局 ID
-                candidates:    [B, C] long — 粗排候选 ID
+                candidates:    [B, C] long — 粗排候选 ID（GT 已强制包含，若提供）
                 coarse_scores: (Tensor[B, num_keys], Tensor[B, num_keys])
-                fine_scores:   [B, C] float — 精排原始分数
+                fine_scores:   [B, C] float — 精排原始分数（空位已打 -inf）
+                cand_mask:     [B, C] bool — True=真实候选，False=空位
 
         异常：
             AssertionError: 输入形状不合法
@@ -142,10 +148,27 @@ class MemoryRouter(nn.Module):
         q_adapted = self.adapter(query_embedding)  # [B, adapter_dim]
 
         # ─── Step 2: ProductKeyMemory — 粗排候选检索 ─────────────────────────────
-        # 返回 4-tuple；第 4 项 q_pkm 为 PKM 内部 L2 归一化子查询，此处不使用
-        candidates, scores_1, scores_2, _ = self.pkm(query_embedding, store)
-        # candidates: [B, num_candidates] long
-        # scores_1/2: [B, num_keys] float
+        # 返回 5-tuple；第 4 项 q_pkm 为 PKM 内部 L2 归一化子查询，此处不使用
+        candidates, scores_1, scores_2, _, valid_mask = self.pkm(query_embedding, store)
+        # candidates:  [B, num_candidates] long
+        # scores_1/2:  [B, num_keys] float
+        # valid_mask:  [B, num_candidates] bool
+
+        # ─── Step 2b: GT 强制插入（训练模式专用）────────────────────────────────
+        # 若 GT 不在粗排候选集中，将最后一格替换为 GT 并标记为有效，
+        # 确保精排损失对所有样本均有有效训练信号（对齐参考项目逻辑）
+        if target_entry_ids is not None:
+            assert target_entry_ids.shape == (B,), (
+                f"target_entry_ids 形状应为 ({B},)，实际 {tuple(target_entry_ids.shape)}"
+            )
+            # 必须同时检查 valid_mask，避免 padding 0 与 entry_id=0 的误匹配
+            gt_in_cands = (
+                (candidates == target_entry_ids.unsqueeze(1)) & valid_mask
+            ).any(dim=1)  # [B] bool
+            missing = ~gt_in_cands  # [B] bool，GT 不在候选集中的样本
+            if missing.any():
+                candidates[missing, -1] = target_entry_ids[missing]
+                valid_mask[missing, -1] = True
 
         C = candidates.shape[1]
 
@@ -182,8 +205,9 @@ class MemoryRouter(nn.Module):
         cand_vecs = cand_vecs_flat.view(B, C, self._adapter_dim)  # [B, C, adapter_dim]
 
         # ─── Step 4: RefinedSelector — 精排评分 ──────────────────────────────────
-        fine_scores, best_local_idx = self.selector(q_adapted, cand_vecs)
-        # fine_scores:     [B, C] float（原始分数，训练时用 softmax + CE loss）
+        # 传入 valid_mask：空位分数打 -inf，精排只在真实候选之间竞争
+        fine_scores, best_local_idx = self.selector(q_adapted, cand_vecs, mask=valid_mask)
+        # fine_scores:     [B, C] float（空位已为 -inf，训练时用 softmax + CE loss）
         # best_local_idx:  [B] long，值域 [0, C)
 
         # ─── Step 5: 局部 ID → 全局知识 ID ───────────────────────────────────────
@@ -200,6 +224,7 @@ class MemoryRouter(nn.Module):
             candidates=candidates,
             coarse_scores=(scores_1, scores_2),
             fine_scores=fine_scores,
+            cand_mask=valid_mask,
         )
 
     @torch.no_grad()

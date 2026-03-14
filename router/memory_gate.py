@@ -18,7 +18,7 @@ Product Key Memory 粗排模块
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -129,7 +129,7 @@ class ProductKeyMemory(nn.Module):
         self,
         embedding: torch.Tensor,
         store: "DualKnowledgeStore",
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         粗排检索主流程。
 
@@ -141,7 +141,8 @@ class ProductKeyMemory(nn.Module):
             candidates:  Tensor[B, num_candidates]  — 候选知识条目 ID（long）
             scores_1:    Tensor[B, num_keys]         — 行匹配分数（训练损失用）
             scores_2:    Tensor[B, num_keys]         — 列匹配分数（训练损失用）
-            q_adapted:   Tensor[B, key_proj_dim]     — L2 归一化行子查询（传给 RefinedSelector）
+            q_adapted:   Tensor[B, key_proj_dim]     — L2 归一化行子查询
+            valid_mask:  Tensor[B, num_candidates]   — bool，True=真实候选，False=空位
 
         异常：
             AssertionError: embedding 形状不合法
@@ -178,16 +179,16 @@ class ProductKeyMemory(nn.Module):
             + top_cols.unsqueeze(1).expand(-1, self.K_COARSE, -1)
         ).reshape(embedding.size(0), -1)  # [B, K_COARSE * K_COARSE = 16]
 
-        # Phase 5: 倒排索引查询 → 候选知识条目 ID
-        candidates = self._lookup_candidates(grid_indices, store)  # [B, num_candidates]
+        # Phase 5: 倒排索引查询 → 候选知识条目 ID + 有效位掩码
+        candidates, valid_mask = self._lookup_candidates(grid_indices, store)  # [B, num_candidates]
 
-        return candidates, scores_1, scores_2, q1
+        return candidates, scores_1, scores_2, q1, valid_mask
 
     def _lookup_candidates(
         self,
         grid_indices: torch.Tensor,
         store: "DualKnowledgeStore",
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         倒排索引查询：从选中的 K_COARSE² 个 grid cell 收集候选知识条目 ID。
 
@@ -195,17 +196,23 @@ class ProductKeyMemory(nn.Module):
             - max_candidates_per_cell = -1：全量倒排（每格取所有条目）
             - max_candidates_per_cell > 0：每格最多取该数目（=1 时退化为 1:1 简单映射）
 
+        不足 num_candidates 时用 0 填充并在 valid_mask 中标记为 False，
+        不再循环重复填充（循环填充会导致 GT 多次出现，精排产生矛盾梯度）。
+
         参数：
             grid_indices: [B, K_COARSE²] 的 grid cell ID 张量（long）
             store: DualKnowledgeStore 实例
 
         返回：
-            [B, num_candidates] 的候选 ID 张量（long）
-            不足 num_candidates 时循环重复填满；全空 store 时全零填充
+            candidates:  [B, num_candidates] long — 候选知识条目 ID，空位填 0
+            valid_mask:  [B, num_candidates] bool — True=真实候选，False=空位
         """
         b_size = grid_indices.size(0)
         result = torch.zeros(
             (b_size, self.num_candidates), dtype=torch.long, device=grid_indices.device
+        )
+        valid_mask = torch.zeros(
+            (b_size, self.num_candidates), dtype=torch.bool, device=grid_indices.device
         )
         cap = self.max_candidates_per_cell  # -1=不限，>0=每格上限
 
@@ -225,12 +232,9 @@ class ProductKeyMemory(nn.Module):
             if ids_list:
                 combined = torch.cat(ids_list)  # [total_count]
                 total = combined.size(0)
-                if total >= self.num_candidates:
-                    result[b] = combined[: self.num_candidates]
-                else:
-                    # 不足则循环重复填满（MVP 简化处理）
-                    repeats = math.ceil(self.num_candidates / total)
-                    result[b] = combined.repeat(repeats)[: self.num_candidates]
-            # else: result[b] 保持全零（指向 entry 0，空 store 的安全处理）
+                fill = min(total, self.num_candidates)
+                result[b, :fill] = combined[:fill]
+                valid_mask[b, :fill] = True
+            # else: result[b] 保持全零，valid_mask[b] 保持全 False（空 store 的安全处理）
 
-        return result
+        return result, valid_mask
