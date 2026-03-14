@@ -76,11 +76,13 @@ def _make_mock_router_output(B: int, num_keys: int = 8, num_candidates: int = 4)
     coarse_2 = torch.randn(B, num_keys)
     fine_scores = torch.randn(B, num_candidates)
     best_id = candidates[:, 0]
+    cand_mask = torch.ones(B, num_candidates, dtype=torch.bool)
     return RouterOutput(
         best_id=best_id,
         candidates=candidates,
         coarse_scores=(coarse_1, coarse_2),
         fine_scores=fine_scores,
+        cand_mask=cand_mask,
     )
 
 
@@ -110,46 +112,6 @@ def test_compute_teacher_logits_shape():
     assert not torch.isnan(t2).any(), "teacher_logits_2 含 NaN"
 
 
-# ─────────────────────────────────────────────────────
-# 测试 2: compute_target_local_idx — 命中
-# ─────────────────────────────────────────────────────
-
-
-def test_compute_target_local_idx_hit():
-    """
-    target 在 candidates 中时，应返回对应的局部索引（0-based）。
-    """
-    from training.phase1_router import compute_target_local_idx
-
-    # candidates[0] = [5, 3, 8, 1], target[0] = 8 → 局部索引 2
-    # candidates[1] = [2, 7, 4, 0], target[1] = 2 → 局部索引 0
-    candidates = torch.tensor([[5, 3, 8, 1], [2, 7, 4, 0]], dtype=torch.long)
-    target_ids = torch.tensor([8, 2], dtype=torch.long)
-
-    local_idx = compute_target_local_idx(target_ids, candidates)
-
-    assert local_idx[0].item() == 2, f"期望局部索引 2，实际 {local_idx[0].item()}"
-    assert local_idx[1].item() == 0, f"期望局部索引 0，实际 {local_idx[1].item()}"
-
-
-# ─────────────────────────────────────────────────────
-# 测试 3: compute_target_local_idx — 未命中
-# ─────────────────────────────────────────────────────
-
-
-def test_compute_target_local_idx_miss():
-    """
-    target 不在 candidates 中时，应返回 -100（fine_loss 的 ignore_index）。
-    """
-    from training.phase1_router import compute_target_local_idx
-
-    candidates = torch.tensor([[5, 3, 8, 1]], dtype=torch.long)
-    target_ids = torch.tensor([99], dtype=torch.long)  # 99 不在 candidates 中
-
-    local_idx = compute_target_local_idx(target_ids, candidates)
-
-    assert local_idx[0].item() == -100, f"期望 -100，实际 {local_idx[0].item()}"
-
 
 # ─────────────────────────────────────────────────────
 # 测试 4: compute_router_loss — 可反向传播
@@ -174,22 +136,24 @@ def test_compute_router_loss_backward():
     candidates = torch.randint(0, 16, (B, C))
     from router.model import RouterOutput
 
+    # GT 知识 ID 强制放在 candidates 第 0 列，保证 entry_ids 一定在候选集中
+    entry_ids = candidates[:, 0].clone()
+    cand_mask = torch.ones(B, C, dtype=torch.bool)
     out = RouterOutput(
         best_id=candidates[:, 0],
         candidates=candidates,
         coarse_scores=(coarse_1, coarse_2),
         fine_scores=fine_scores,
+        cand_mask=cand_mask,
     )
 
     target_row = torch.randint(0, num_keys, (B,))
     target_col = torch.randint(0, num_keys, (B,))
     teacher_log1 = torch.randn(B, num_keys)
     teacher_log2 = torch.randn(B, num_keys)
-    # 所有样本均命中（局部索引 0-3 有效）
-    target_local_idx = torch.randint(0, C, (B,))
 
     total, ce, kl, fine = compute_router_loss(
-        out, target_row, target_col, teacher_log1, teacher_log2, target_local_idx,
+        out, target_row, target_col, teacher_log1, teacher_log2, entry_ids,
         temperature=0.1,
     )
 

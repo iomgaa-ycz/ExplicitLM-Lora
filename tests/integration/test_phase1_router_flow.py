@@ -265,7 +265,6 @@ def test_phase_b_two_steps(tmp_path):
     from training.phase1_router import (
         RouterTrainDataset,
         compute_router_loss,
-        compute_target_local_idx,
         compute_teacher_logits,
     )
     from router.model import MemoryRouter
@@ -308,15 +307,12 @@ def test_phase_b_two_steps(tmp_path):
         # teacher logits
         teacher_log1, teacher_log2 = compute_teacher_logits(q_emb.detach(), router.pkm, 0.1)
 
-        # router forward
-        out = router(q_emb, store)
-
-        # 精排局部索引
-        target_local = compute_target_local_idx(entry_ids_b, out.candidates)
+        # router forward（GT 强制插入候选集）
+        out = router(q_emb, store, target_entry_ids=entry_ids_b)
 
         # 损失
         loss, ce, kl, fine = compute_router_loss(
-            out, target_row_b, target_col_b, teacher_log1, teacher_log2, target_local
+            out, target_row_b, target_col_b, teacher_log1, teacher_log2, entry_ids_b
         )
 
         loss.backward()
@@ -408,7 +404,7 @@ def test_evaluate_recall_at_k_smoke():
     anchor_ids = torch.randint(0, 3000, (N, cfg.model.anchor_length))
     dataset = RouterTrainDataset(anchor_ids, id_to_rowcol)
 
-    recall = evaluate_recall_at_k(
+    recall, _, _ = evaluate_recall_at_k(
         router, store, dataset, encoder,
         device=torch.device("cpu"),
         Ks=[1, 4, 16],
@@ -435,7 +431,6 @@ def test_write_report(
     from training.phase1_router import (
         RouterTrainDataset,
         compute_router_loss,
-        compute_target_local_idx,
         compute_teacher_logits,
         evaluate_recall_at_k,
     )
@@ -461,13 +456,13 @@ def test_write_report(
     for step, batch in enumerate(loader):
         if step >= 3:
             break
+        entry_ids_b = batch["entry_id"]
         q_emb = encoder.encode_mean(batch["anchor_ids"], batch["anchor_mask"])
         teacher_log1, teacher_log2 = compute_teacher_logits(q_emb.detach(), router.pkm, 0.1)
-        out = router(q_emb, store)
-        target_local = compute_target_local_idx(batch["entry_id"], out.candidates)
+        out = router(q_emb, store, target_entry_ids=entry_ids_b)
         loss, ce, kl, fine = compute_router_loss(
             out, batch["target_row"], batch["target_col"],
-            teacher_log1, teacher_log2, target_local
+            teacher_log1, teacher_log2, entry_ids_b
         )
         loss.backward()
         optimizer.step()
@@ -480,7 +475,7 @@ def test_write_report(
             "fine": float(fine),
         })
 
-    recall = evaluate_recall_at_k(
+    recall, _, _ = evaluate_recall_at_k(
         router, store, dataset, encoder,
         device=torch.device("cpu"), Ks=[1, 4, 16], max_eval_samples=32,
     )
