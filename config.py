@@ -126,6 +126,8 @@ class TrainConfig:
     grad_clip: float
     bf16: bool
     phase1_gradient_accumulation_steps: int
+    phase2_gradient_accumulation_steps: int
+    phase3_gradient_accumulation_steps: int
     phase1_recluster_batch_size: int
 
 
@@ -151,6 +153,8 @@ class DataConfig:
     phase1_parquet_dir: str
     phase1_tokenize_batch_size: int
     phase1_recluster_chunk_size: int
+    phase2_n_samples_per_epoch: int
+    phase3_max_seq_length: int
 
 
 @dataclass

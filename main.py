@@ -78,15 +78,20 @@ def _cmd_build_knowledge(cfg: Any, args: argparse.Namespace) -> None:
 
 def _cmd_train(cfg: Any, args: argparse.Namespace) -> None:
     """Phase 1-3: 训练管线。"""
+    device = getattr(args, "device", "cpu")
     if args.phase == 1:
         from training.phase1_router import train_phase1
 
-        device = getattr(args, "device", "cpu")
         train_phase1(cfg, device)
     elif args.phase == 2:
-        print("[WARN] train --phase 2: Fusion 预训练尚未实现")
+        from training.phase2_fusion import train_phase2
+
+        train_phase2(cfg, device)
     elif args.phase == 3:
-        print("[WARN] train --phase 3: SFT 尚未实现")
+        from training.phase3_sft import train_phase3
+
+        phase2_ckpt = getattr(args, "from_phase2", None)
+        train_phase3(cfg, device, phase2_ckpt=phase2_ckpt)
     else:
         print(f"[WARN] train --phase {args.phase}: 未知阶段")
 
@@ -171,6 +176,13 @@ def main() -> None:
     train_parser = subparsers.add_parser("train", help="Phase 1-3: 训练管线")
     train_parser.add_argument(
         "--phase", type=int, required=True, choices=[0, 1, 2, 3], help="训练阶段"
+    )
+    train_parser.add_argument(
+        "--from-phase2",
+        type=str,
+        default=None,
+        dest="from_phase2",
+        help="Phase 3 专用：Phase 2 最优 checkpoint 目录（默认 checkpoints/phase2_best）",
     )
     subparsers.add_parser("eval", help="评测入口")
     answer_parser = subparsers.add_parser("answer", help="端到端 QA")

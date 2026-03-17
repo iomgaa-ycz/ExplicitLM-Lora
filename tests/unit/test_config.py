@@ -61,6 +61,9 @@ VALID_YAML_CONTENT = textwrap.dedent(
       num_candidates: 32
       temperature: 0.1
       recluster_threshold: 0.1
+      max_candidates_per_cell: -1
+      refined_num_heads: 8
+      refined_num_layers: 2
 
     train:
       phase1_lr: 1.0e-3
@@ -78,12 +81,21 @@ VALID_YAML_CONTENT = textwrap.dedent(
       phase3_warmup_steps: 50
       grad_clip: 1.0
       bf16: true
+      phase1_gradient_accumulation_steps: 8
+      phase2_gradient_accumulation_steps: 4
+      phase3_gradient_accumulation_steps: 1
+      phase1_recluster_batch_size: 10240
 
     data:
       fusion_length: 64
       anchor_length: 128
       num_workers: 4
       train_max_samples: -1
+      phase1_parquet_dir: "data/compressed/v2"
+      phase1_tokenize_batch_size: 10000
+      phase1_recluster_chunk_size: 512
+      phase2_n_samples_per_epoch: 131072
+      phase3_max_seq_length: 256
 
     paths:
       model_dir: "models/qwen3-0.6B"
@@ -92,6 +104,13 @@ VALID_YAML_CONTENT = textwrap.dedent(
       checkpoint_dir: "checkpoints"
       log_dir: "logs"
       results_dir: "results"
+
+    swanlab:
+      project: "explicit-lora-test"
+      enabled: false
+      log_every_n_steps: 50
+      phase1_log_acc_steps: 1000
+      phase1_log_recall_k: 8
 
     eval:
       medqa_knowledge_map: "data/medqa_knowledge.jsonl"

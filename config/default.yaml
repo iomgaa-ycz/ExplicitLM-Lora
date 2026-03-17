@@ -71,6 +71,10 @@ train:
   bf16: true
   # Phase 1 梯度累积步数（等效 batch_size = phase1_batch_size × phase1_gradient_accumulation_steps）
   phase1_gradient_accumulation_steps: 8
+  # Phase 2 梯度累积步数（等效 batch_size = phase2_batch_size × phase2_gradient_accumulation_steps）
+  phase2_gradient_accumulation_steps: 4
+  # Phase 3 梯度累积步数
+  phase3_gradient_accumulation_steps: 1
   # Phase 1 重聚类时 compact_and_recluster 内部 encoder 编码批大小
   phase1_recluster_batch_size: 10240
 
@@ -89,6 +93,10 @@ data:
   phase1_tokenize_batch_size: 10000
   # Phase 1 重聚类时 encoder 编码的分块大小（避免 OOM）
   phase1_recluster_chunk_size: 512
+  # Phase 2 每 epoch 从 FineWeb-Edu Parquet 采样的样本数（-1=全量，通常设 128K）
+  phase2_n_samples_per_epoch: 131072
+  # Phase 3 SFT 序列最大长度（question+options+answer 拼接后的 token 上限）
+  phase3_max_seq_length: 256
 
 paths:
   # 基础模型权重目录（可被 .env 中的 MODEL_PATH 覆盖为绝对路径）
