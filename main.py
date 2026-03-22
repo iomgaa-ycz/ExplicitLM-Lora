@@ -36,18 +36,30 @@ from pipeline import ExplicitLMPipeline  # noqa: E402
 # ─────────────────────────────────────────────
 
 
-def _parse_overrides(overrides: list[str]) -> dict[str, Any]:
+def _parse_overrides(overrides: list[str] | None) -> dict[str, Any]:
     """
     解析 key=value 列表为嵌套 dict。
 
     参数：
-        overrides: 形如 ["router.dim=512", "train.bf16=true"] 的列表
+        overrides: action="append" 产生的嵌套列表，如 [["a=1"], ["b=2"]]，
+                   或 None（无 --override 时）
 
     返回：
         扁平 dict，key 为点路径，value 为字符串
     """
-    result: dict[str, Any] = {}
+    if overrides is None:
+        return {}
+
+    # 展平嵌套列表（action="append" 产生嵌套结构）
+    flat: list[str] = []
     for item in overrides:
+        if isinstance(item, list):
+            flat.extend(item)
+        else:
+            flat.append(item)
+
+    result: dict[str, Any] = {}
+    for item in flat:
         if "=" not in item:
             print(f"[ERROR] 无效的 override 格式（缺少 '='）: {item}")
             sys.exit(1)
@@ -168,7 +180,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Explicit-LoRA CLI")
     parser.add_argument("--config", default="config/default.yaml", help="配置文件路径")
     parser.add_argument("--device", default="cpu", help="设备（cpu / cuda:0 等）")
-    parser.add_argument("--override", nargs="*", help="key=value 配置覆盖")
+    parser.add_argument("--override", nargs="?", action="append", help="key=value 配置覆盖（可多次指定）")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # 生产命令

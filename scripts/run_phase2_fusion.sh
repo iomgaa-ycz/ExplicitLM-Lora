@@ -3,7 +3,7 @@
 #
 # 用法：
 #   默认双卡（GPU 6,7）：bash scripts/run_phase2_fusion.sh
-#   指定 GPU：       NUM_GPUS=2 GPU_IDS=3,5 bash scripts/run_phase2_fusion.sh
+#   指定 GPU：       NUM_GPUS=1 GPU_IDS=3 bash scripts/run_phase2_fusion.sh
 #   覆盖配置：        bash scripts/run_phase2_fusion.sh --override train.phase2_max_epochs=1
 #
 # 环境变量：
@@ -59,6 +59,8 @@ python -c "import accelerate; import swanlab" 2>/dev/null || {
 }
 
 # ── Accelerate 启动 ──
+# 注意：用户参数 "$@" 必须放在子命令 train --phase 2 之前，
+# 因为 main.py 的 --override 使用 nargs="*"，会贪婪消耗后续参数
 echo "[Phase2Fusion] 启动训练..."
 accelerate launch \
     --num_processes "${NUM_GPUS}" \
@@ -67,5 +69,5 @@ accelerate launch \
     "${PROJECT_ROOT}/main.py" \
     --config "${CONFIG}" \
     --device cuda \
-    train --phase 2 \
-    "$@"
+    "$@" \
+    train --phase 2
